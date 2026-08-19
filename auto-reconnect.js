@@ -3,7 +3,6 @@
 
   // PIW Auto Reconnect — independent implementation.
   // No external requests, analytics, cookies, or credential access.
-  // NOTE: The connection toggle in this version is TEMPORARY test tooling.
 
   const NativeWebSocket = window.WebSocket;
   const nativeSend = NativeWebSocket.prototype.send;
@@ -29,7 +28,6 @@
   ]);
 
   let gameSocket = null;
-  let lastSocketUrl = null;
   let currentHuntSlug = null;
   let lastHuntActivityAt = Date.now();
   let lastReconnectAt = 0;
@@ -166,7 +164,6 @@
     if (!socket || !String(socket.url || '').includes('/ws')) return socket;
 
     gameSocket = socket;
-    lastSocketUrl = String(socket.url || '');
     socketDownSince = 0;
     reloadScheduled = false;
     renderOverlay();
@@ -302,7 +299,6 @@
 
   function makeOverlayDraggable(el) {
     const startDrag = event => {
-      if (event.button !== 0 || event.target.closest('button')) return;
       const rect = el.getBoundingClientRect();
       dragState = {
         offsetX: event.clientX - rect.left,
@@ -338,46 +334,6 @@
     el.addEventListener('pointercancel', endDrag);
   }
 
-  function createTestButton() {
-    const button = document.createElement('button');
-    button.type = 'button';
-    Object.assign(button.style, {
-      width: '100%',
-      marginTop: '7px',
-      padding: '4px 7px',
-      border: '1px solid rgba(255,255,255,.25)',
-      borderRadius: '5px',
-      background: 'rgba(255,255,255,.10)',
-      color: '#fff',
-      font: '600 11px/1.3 system-ui, sans-serif',
-      cursor: 'pointer',
-      userSelect: 'none'
-    });
-
-    button.addEventListener('pointerdown', event => event.stopPropagation());
-    button.addEventListener('click', event => {
-      event.preventDefault();
-      event.stopPropagation();
-
-      if (isOpen()) {
-        log('TESTE: fechando o WebSocket manualmente.');
-        try {
-          gameSocket.close(1000, 'PIW Auto Reconnect test');
-        } catch (error) {
-          log(`Não foi possível fechar o WebSocket: ${error}`, 'warn');
-        }
-      } else {
-        if (lastSocketUrl) {
-          log('TESTE: solicitando reload manual para restabelecer a conexão.');
-          location.reload();
-        }
-      }
-      renderOverlay();
-    });
-
-    return button;
-  }
-
   function renderOverlay() {
     if (!overlay) {
       overlay = document.createElement('div');
@@ -390,13 +346,21 @@
         background: 'rgba(15, 23, 42, 0.94)',
         color: '#fff',
         font: '12px/1.35 system-ui, sans-serif',
-        minWidth: '125px',
+        minWidth: '118px',
         boxShadow: '0 6px 24px rgba(0,0,0,.35)',
         whiteSpace: 'pre-line',
         cursor: 'move',
         userSelect: 'none',
         touchAction: 'none'
       });
+
+      const host = document.documentElement || document.body;
+      if (!host) {
+        document.addEventListener('DOMContentLoaded', renderOverlay, { once: true });
+        return;
+      }
+      host.appendChild(overlay);
+      makeOverlayDraggable(overlay);
 
       const savedPosition = getPosition();
       if (savedPosition) {
@@ -407,28 +371,9 @@
         overlay.style.right = '12px';
         overlay.style.bottom = '12px';
       }
-
-      const host = document.documentElement || document.body;
-      if (!host) {
-        document.addEventListener('DOMContentLoaded', renderOverlay, { once: true });
-        return;
-      }
-      host.appendChild(overlay);
-      makeOverlayDraggable(overlay);
     }
 
-    overlay.textContent = '';
-
-    const status = document.createElement('div');
-    status.textContent = isOpen() ? '🟢 CONECTADO' : '🔴 DESCONECTADO';
-    const count = document.createElement('div');
-    count.textContent = `RECONEXÕES: ${reconnectCount}`;
-    overlay.appendChild(status);
-    overlay.appendChild(count);
-
-    const testButton = createTestButton();
-    testButton.textContent = isOpen() ? 'DESLIGAR' : 'RELIGAR';
-    overlay.appendChild(testButton);
+    overlay.textContent = `${isOpen() ? '🟢 CONECTADO' : '🔴 DESCONECTADO'}\nRECONEXÕES: ${reconnectCount}`;
   }
 
   function bootstrap() {
