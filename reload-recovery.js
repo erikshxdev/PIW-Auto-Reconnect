@@ -14,7 +14,7 @@
   }
 
   const navigation = performance.getEntriesByType('navigation')[0];
-  const isReload = navigation?.type === 'reload' || document.referrer === location.href;
+  const isReload = navigation?.type === 'reload';
   if (!isReload) return;
 
   const state = getState();
@@ -25,21 +25,17 @@
   let socket = null;
   let recovered = false;
 
-  function track(candidate) {
-    if (!candidate || !String(candidate.url || '').includes('/ws')) return;
-    socket = candidate;
-    if (socket.readyState !== NativeWebSocket.OPEN) return;
-    recover();
-  }
-
   function recover() {
     if (recovered || !socket || socket.readyState !== NativeWebSocket.OPEN) return;
     recovered = true;
-
     const slug = state.slug.trim();
+
     setTimeout(() => {
       try {
-        if (socket?.readyState !== NativeWebSocket.OPEN) return;
+        if (socket?.readyState !== NativeWebSocket.OPEN) {
+          recovered = false;
+          return;
+        }
         socket.send(JSON.stringify({ type: 'enter-hunt', slug }));
         sessionStorage.removeItem(RECOVERY_FLAG);
       } catch {
@@ -52,16 +48,15 @@
     const candidate = protocols === undefined
       ? new NativeWebSocket(url)
       : new NativeWebSocket(url, protocols);
-    track(candidate);
+    if (String(candidate.url || '').includes('/ws')) {
+      socket = candidate;
+      if (candidate.readyState === NativeWebSocket.OPEN) recover();
+      else candidate.addEventListener('open', recover, { once: true });
+    }
     return candidate;
   }
 
   TrackedWebSocket.prototype = NativeWebSocket.prototype;
   Object.setPrototypeOf(TrackedWebSocket, NativeWebSocket);
   window.WebSocket = TrackedWebSocket;
-
-  NativeWebSocket.prototype.send = function recoveryPatchedSend(data) {
-    if (this === socket && this.readyState === NativeWebSocket.OPEN) recover();
-    return NativeWebSocket.prototype.send.call(this, data);
-  };
 })();
