@@ -8,14 +8,16 @@
   const nativeSend = NativeWebSocket.prototype.send;
 
   const CONFIG = Object.freeze({
-    huntSilenceMs: 60_000,
+    huntSilenceMs: 120_000,
     reentryDelayMs: 500,
-    reconnectCooldownMs: 5_000,
+    reconnectCooldownMs: 10_000,
     checkIntervalMs: 1_000,
     socketReloadDelayMs: 45_000,
+    confirmationTimeoutMs: 15_000,
     overlayId: 'piw-auto-reconnect-overlay',
-    storageKey: 'piw_auto_reconnect_state_v2',
-    positionKey: 'piw_auto_reconnect_position_v1'
+    storageKey: 'piw_auto_reconnect_state_v3',
+    positionKey: 'piw_auto_reconnect_position_v1',
+    enabledKey: 'piw_auto_reconnect_enabled_v1'
   });
 
   const HUNT_MESSAGE_TYPES = new Set([
@@ -38,6 +40,9 @@
   let reconnectCount = 0;
   let overlay = null;
   let dragState = null;
+  let enabled = true;
+  let awaitingRejoinConfirmation = false;
+  let rejoinConfirmationDeadline = 0;
 
   function now() {
     return Date.now();
@@ -79,6 +84,28 @@
     if (Number.isFinite(state.reconnectCount)) reconnectCount = Math.max(0, state.reconnectCount);
   }
 
+  function readEnabled() {
+    try {
+      const stored = localStorage.getItem(CONFIG.enabledKey);
+      return stored !== 'false';
+    } catch {
+      return true;
+    }
+  }
+
+  function saveEnabled(value) {
+    enabled = Boolean(value);
+    try {
+      localStorage.setItem(CONFIG.enabledKey, String(enabled));
+    } catch {}
+    if (!enabled) {
+      reloadScheduled = false;
+      awaitingRejoinConfirmation = false;
+      reconnectInProgress = false;
+    }
+    renderOverlay();
+  }
+
   function getPosition() {
     try {
       const position = JSON.parse(localStorage.getItem(CONFIG.positionKey) || '{}');
@@ -116,6 +143,18 @@
     return HUNT_MESSAGE_TYPES.has(type) || isHuntProgressMessage(message);
   }
 
+  function confirmRejoinFromActivity() {
+    if (!awaitingRejoinConfirmation) return;
+    if (now() > rejoinConfirmationDeadline) return;
+
+    awaitingRejoinConfirmation = false;
+    rejoinConfirmationDeadline = 0;
+    reconnectCount += 1;
+    saveState();
+    log(`Reconexão confirmada em ${currentHuntSlug}.`);
+    renderOverlay();
+  }
+
   function observeIncoming(event) {
     let message;
     try {
@@ -124,10 +163,13 @@
       return;
     }
 
-    if (isHuntMessage(message)) lastHuntActivityAt = now();
+    if (isHuntMessage(message)) {
+      lastHuntActivityAt = now();
+      confirmRejoinFromActivity();
+    }
 
     const type = String(message?.type || '').toLowerCase();
-    if (/leave-hunt|hunt-left|leavehunt/.test(type)) {
+    if (/leave-hunt|hunt-left|leavehunt/.test(type) && !reconnectInProgress) {
       likelyInHunt = false;
       saveState({ reconnectPending: false });
     }
@@ -148,13 +190,13 @@
     if (type === 'enter-hunt' && message.slug) {
       currentHuntSlug = String(message.slug).trim();
       likelyInHunt = true;
-      lastHuntActivityAt = now();
+      if (!reconnectInProgress) lastHuntActivityAt = now();
       socketDownSince = 0;
-      saveState({ reconnectPending: false });
+      if (!reconnectInProgress) saveState({ reconnectPending: false });
       return;
     }
 
-    if (type === 'leave-hunt') {
+    if (type === 'leave-hunt' && !reconnectInProgress) {
       likelyInHunt = false;
       saveState({ reconnectPending: false });
     }
@@ -169,10 +211,10 @@
     renderOverlay();
 
     const state = getState();
-    if (state.reconnectPending === true && state.likelyInHunt === true && currentHuntSlug) {
+    if (state.reconnectPending === true && state.likelyInHunt === true && currentHuntSlug && enabled) {
       saveState({ reconnectPending: false });
       setTimeout(() => {
-        if (isOpen() && likelyInHunt && currentHuntSlug) {
+        if (enabled && isOpen() && likelyInHunt && currentHuntSlug) {
           void rejoinCurrentHunt('Reload de recuperação concluído.');
         }
       }, 2_000);
@@ -183,9 +225,9 @@
       if (gameSocket === socket) {
         gameSocket = null;
         socketDownSince = now();
-        if (likelyInHunt && currentHuntSlug) saveState({ reconnectPending: true });
-        log('WebSocket da API do jogo caiu.', 'warn');
+        if (likelyInHunt) saveState({ reconnectPending: enabled });
         renderOverlay();
+        log('WebSocket da API do jogo caiu.', 'warn');
       }
     });
 
@@ -225,7 +267,7 @@
   }
 
   async function rejoinCurrentHunt(reason) {
-    if (reconnectInProgress || !currentHuntSlug) return false;
+    if (!enabled || reconnectInProgress || awaitingRejoinConfirmation || !currentHuntSlug) return false;
 
     reconnectInProgress = true;
     lastReconnectAt = now();
@@ -235,23 +277,42 @@
 
       await new Promise(resolve => setTimeout(resolve, CONFIG.reentryDelayMs));
 
-      const entered = sendGameMessage({ type: 'enter-hunt', slug: currentHuntSlug });
+      if (!enabled || !isOpen()) return false;
+
+      const entered = sendGameMessage({
+        type: 'enter-hunt',
+        slug: currentHuntSlug
+      });
       if (!entered) return false;
 
-      reconnectCount += 1;
-      likelyInHunt = true;
+      // Sending enter-hunt is NOT counted as success. We wait for real hunt activity.
+      awaitingRejoinConfirmation = true;
+      rejoinConfirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
       lastHuntActivityAt = now();
-      saveState();
-      log(`${reason} Reentrei em ${currentHuntSlug}.`);
-      renderOverlay();
+      log(`${reason} Tentando reentrar em ${currentHuntSlug}; aguardando confirmação.`);
       return true;
     } finally {
       reconnectInProgress = false;
+      renderOverlay();
     }
   }
 
   function monitor() {
     const t = now();
+
+    if (!enabled) {
+      renderOverlay();
+      return;
+    }
+
+    if (awaitingRejoinConfirmation) {
+      if (t > rejoinConfirmationDeadline) {
+        awaitingRejoinConfirmation = false;
+        rejoinConfirmationDeadline = 0;
+        log('A tentativa de reconexão não foi confirmada; nenhuma reconexão foi contabilizada.', 'warn');
+      }
+      renderOverlay();
+    }
 
     if (!isOpen()) {
       if (!socketDownSince) socketDownSince = t;
@@ -262,7 +323,9 @@
           reloadScheduled = true;
           saveState({ reconnectPending: true });
           log('WebSocket continua fechado; recarregando a página.', 'warn');
-          setTimeout(() => location.reload(), 1_000);
+          setTimeout(() => {
+            if (enabled) location.reload();
+          }, 1_000);
         }
       }
       renderOverlay();
@@ -272,6 +335,11 @@
     socketDownSince = 0;
 
     if (!likelyInHunt || !currentHuntSlug) {
+      renderOverlay();
+      return;
+    }
+
+    if (awaitingRejoinConfirmation) {
       renderOverlay();
       return;
     }
@@ -299,6 +367,7 @@
 
   function makeOverlayDraggable(el) {
     const startDrag = event => {
+      if (event.button !== 0 || event.target.closest('button')) return;
       const rect = el.getBoundingClientRect();
       dragState = {
         offsetX: event.clientX - rect.left,
@@ -334,6 +403,33 @@
     el.addEventListener('pointercancel', endDrag);
   }
 
+  function createToggleButton() {
+    const button = document.createElement('button');
+    button.type = 'button';
+    Object.assign(button.style, {
+      width: '100%',
+      marginTop: '7px',
+      padding: '4px 7px',
+      border: '1px solid rgba(255,255,255,.25)',
+      borderRadius: '5px',
+      background: 'rgba(255,255,255,.10)',
+      color: '#fff',
+      font: '600 10px/1.3 system-ui, sans-serif',
+      cursor: 'pointer',
+      userSelect: 'none'
+    });
+
+    button.addEventListener('pointerdown', event => event.stopPropagation());
+    button.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      saveEnabled(!enabled);
+      log(`AUTO RECONNECT ${enabled ? 'LIGADO' : 'DESLIGADO'}.`);
+    });
+
+    return button;
+  }
+
   function renderOverlay() {
     if (!overlay) {
       overlay = document.createElement('div');
@@ -346,21 +442,13 @@
         background: 'rgba(15, 23, 42, 0.94)',
         color: '#fff',
         font: '12px/1.35 system-ui, sans-serif',
-        minWidth: '118px',
+        minWidth: '125px',
         boxShadow: '0 6px 24px rgba(0,0,0,.35)',
         whiteSpace: 'pre-line',
         cursor: 'move',
         userSelect: 'none',
         touchAction: 'none'
       });
-
-      const host = document.documentElement || document.body;
-      if (!host) {
-        document.addEventListener('DOMContentLoaded', renderOverlay, { once: true });
-        return;
-      }
-      host.appendChild(overlay);
-      makeOverlayDraggable(overlay);
 
       const savedPosition = getPosition();
       if (savedPosition) {
@@ -371,13 +459,35 @@
         overlay.style.right = '12px';
         overlay.style.bottom = '12px';
       }
+
+      const host = document.documentElement || document.body;
+      if (!host) {
+        document.addEventListener('DOMContentLoaded', renderOverlay, { once: true });
+        return;
+      }
+      host.appendChild(overlay);
+      makeOverlayDraggable(overlay);
     }
 
-    overlay.textContent = `${isOpen() ? '🟢 CONECTADO' : '🔴 DESCONECTADO'}\nRECONEXÕES: ${reconnectCount}`;
+    overlay.textContent = '';
+
+    const status = document.createElement('div');
+    status.textContent = isOpen() ? '🟢 CONECTADO' : '🔴 DESCONECTADO';
+
+    const count = document.createElement('div');
+    count.textContent = `RECONEXÕES: ${reconnectCount}`;
+
+    const toggle = createToggleButton();
+    toggle.textContent = enabled ? 'AUTO RECONNECT: ON' : 'AUTO RECONNECT: OFF';
+
+    overlay.appendChild(status);
+    overlay.appendChild(count);
+    overlay.appendChild(toggle);
   }
 
   function bootstrap() {
     restoreState();
+    enabled = readEnabled();
     renderOverlay();
 
     window.addEventListener('beforeunload', () => saveState());
