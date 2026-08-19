@@ -40,7 +40,6 @@
   let reconnectCount = 0;
   let overlay = null;
   let dragState = null;
-  let manualDisconnectTest = false;
 
   function now() {
     return Date.now();
@@ -170,7 +169,6 @@
     lastSocketUrl = String(socket.url || '');
     socketDownSince = 0;
     reloadScheduled = false;
-    manualDisconnectTest = false;
     renderOverlay();
 
     const state = getState();
@@ -261,7 +259,7 @@
     if (!isOpen()) {
       if (!socketDownSince) socketDownSince = t;
 
-      if (likelyInHunt && currentHuntSlug && !manualDisconnectTest) {
+      if (likelyInHunt && currentHuntSlug) {
         const downFor = t - socketDownSince;
         if (!reloadScheduled && downFor >= CONFIG.socketReloadDelayMs) {
           reloadScheduled = true;
@@ -362,16 +360,13 @@
       event.stopPropagation();
 
       if (isOpen()) {
-        manualDisconnectTest = true;
         log('TESTE: fechando o WebSocket manualmente.');
         try {
           gameSocket.close(1000, 'PIW Auto Reconnect test');
         } catch (error) {
           log(`Não foi possível fechar o WebSocket: ${error}`, 'warn');
-          manualDisconnectTest = false;
         }
       } else {
-        manualDisconnectTest = false;
         if (lastSocketUrl) {
           log('TESTE: solicitando reload manual para restabelecer a conexão.');
           location.reload();
@@ -426,16 +421,10 @@
 
     const status = document.createElement('div');
     status.textContent = isOpen() ? '🟢 CONECTADO' : '🔴 DESCONECTADO';
-
     const count = document.createElement('div');
     count.textContent = `RECONEXÕES: ${reconnectCount}`;
-
-    if (!overlay.querySelector('button')) overlay.appendChild(status);
-    else overlay.insertBefore(status, overlay.firstChild);
+    overlay.appendChild(status);
     overlay.appendChild(count);
-
-    const existingButton = overlay.querySelector('button');
-    if (existingButton) existingButton.remove();
 
     const testButton = createTestButton();
     testButton.textContent = isOpen() ? 'DESLIGAR' : 'RELIGAR';
