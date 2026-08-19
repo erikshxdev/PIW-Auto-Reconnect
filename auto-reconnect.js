@@ -8,13 +8,14 @@
   const nativeSend = NativeWebSocket.prototype.send;
 
   const CONFIG = Object.freeze({
-    huntSilenceMs: 10_000,
+    huntSilenceMs: 60_000,
     reentryDelayMs: 500,
     reconnectCooldownMs: 5_000,
     checkIntervalMs: 1_000,
     socketReloadDelayMs: 45_000,
     overlayId: 'piw-auto-reconnect-overlay',
-    storageKey: 'piw_auto_reconnect_state_v1'
+    storageKey: 'piw_auto_reconnect_state_v2',
+    positionKey: 'piw_auto_reconnect_position_v1'
   });
 
   const HUNT_MESSAGE_TYPES = new Set([
@@ -34,9 +35,9 @@
   let reloadScheduled = false;
   let reconnectInProgress = false;
   let likelyInHunt = false;
-  let lastStatus = 'Inicializando…';
   let reconnectCount = 0;
-  let lastMessageType = '—';
+  let overlay = null;
+  let dragState = null;
 
   function now() {
     return Date.now();
@@ -61,6 +62,7 @@
       const state = {
         slug: currentHuntSlug,
         likelyInHunt,
+        reconnectCount,
         updatedAt: now(),
         ...extra
       };
@@ -74,15 +76,25 @@
     const state = getState();
     if (typeof state.slug === 'string' && state.slug.trim()) currentHuntSlug = state.slug.trim();
     likelyInHunt = state.likelyInHunt === true;
+    if (Number.isFinite(state.reconnectCount)) reconnectCount = Math.max(0, state.reconnectCount);
   }
 
-  function setStatus(status) {
-    lastStatus = status;
-    renderOverlay();
+  function getPosition() {
+    try {
+      const position = JSON.parse(localStorage.getItem(CONFIG.positionKey) || '{}');
+      if (Number.isFinite(position.left) && Number.isFinite(position.top)) return position;
+    } catch {}
+    return null;
+  }
+
+  function savePosition(left, top) {
+    try {
+      localStorage.setItem(CONFIG.positionKey, JSON.stringify({ left, top }));
+    } catch {}
   }
 
   function isOpen() {
-    return gameSocket && gameSocket.readyState === NativeWebSocket.OPEN;
+    return Boolean(gameSocket && gameSocket.readyState === NativeWebSocket.OPEN);
   }
 
   function isHuntProgressMessage(message) {
@@ -112,12 +124,7 @@
       return;
     }
 
-    lastMessageType = String(message?.type || '—');
-
-    if (isHuntMessage(message)) {
-      lastHuntActivityAt = now();
-      if (likelyInHunt) setStatus(`Hunt ativa · ${currentHuntSlug || 'slug não identificado'}`);
-    }
+    if (isHuntMessage(message)) lastHuntActivityAt = now();
 
     const type = String(message?.type || '').toLowerCase();
     if (/leave-hunt|hunt-left|leavehunt/.test(type)) {
@@ -144,8 +151,6 @@
       lastHuntActivityAt = now();
       socketDownSince = 0;
       saveState({ reconnectPending: false });
-      setStatus(`Hunt ativa · ${currentHuntSlug}`);
-      log(`Hunt detectada: ${currentHuntSlug}`);
       return;
     }
 
@@ -161,7 +166,6 @@
     gameSocket = socket;
     socketDownSince = 0;
     reloadScheduled = false;
-    setStatus(`WebSocket conectado · ${currentHuntSlug || 'aguardando hunt'}`);
 
     const state = getState();
     if (state.reconnectPending === true && state.likelyInHunt === true && currentHuntSlug) {
@@ -179,14 +183,9 @@
         gameSocket = null;
         socketDownSince = now();
         if (likelyInHunt && currentHuntSlug) saveState({ reconnectPending: true });
-        setStatus('WebSocket desconectado');
         log('WebSocket da API do jogo caiu.', 'warn');
       }
     });
-    socket.addEventListener('error', () => {
-      if (gameSocket === socket) setStatus('Erro no WebSocket');
-    });
-
     return socket;
   }
 
@@ -199,7 +198,6 @@
 
   TrackedWebSocket.prototype = NativeWebSocket.prototype;
   Object.setPrototypeOf(TrackedWebSocket, NativeWebSocket);
-
   window.WebSocket = TrackedWebSocket;
 
   NativeWebSocket.prototype.send = function patchedSend(data) {
@@ -220,42 +218,25 @@
   }
 
   async function rejoinCurrentHunt(reason) {
-    if (reconnectInProgress) return false;
-    if (!currentHuntSlug) {
-      setStatus('Hunt não identificada · aguardando nova entrada');
-      return false;
-    }
+    if (reconnectInProgress || !currentHuntSlug) return false;
 
     reconnectInProgress = true;
     lastReconnectAt = now();
-    setStatus(`Recuperando ${currentHuntSlug}…`);
 
     try {
-      const left = sendGameMessage({ type: 'leave-hunt' });
-      if (!left) {
-        setStatus('Falha: WebSocket ficou indisponível');
-        return false;
-      }
+      if (!sendGameMessage({ type: 'leave-hunt' })) return false;
 
       await new Promise(resolve => setTimeout(resolve, CONFIG.reentryDelayMs));
 
-      const entered = sendGameMessage({
-        type: 'enter-hunt',
-        slug: currentHuntSlug
-      });
+      const entered = sendGameMessage({ type: 'enter-hunt', slug: currentHuntSlug });
+      if (!entered) return false;
 
-      if (entered) {
-        reconnectCount += 1;
-        likelyInHunt = true;
-        lastHuntActivityAt = now();
-        saveState();
-        setStatus(`Reconectado · ${currentHuntSlug}`);
-        log(`${reason} Reentrei em ${currentHuntSlug}.`);
-      } else {
-        setStatus('Falha no reenvio de enter-hunt');
-      }
-
-      return entered;
+      reconnectCount += 1;
+      likelyInHunt = true;
+      lastHuntActivityAt = now();
+      saveState();
+      log(`${reason} Reentrei em ${currentHuntSlug}.`);
+      return true;
     } finally {
       reconnectInProgress = false;
     }
@@ -269,83 +250,139 @@
 
       if (likelyInHunt && currentHuntSlug) {
         const downFor = t - socketDownSince;
-        setStatus(`WebSocket offline · ${Math.floor(downFor / 1000)}s`);
-
         if (!reloadScheduled && downFor >= CONFIG.socketReloadDelayMs) {
           reloadScheduled = true;
           saveState({ reconnectPending: true });
-          setStatus('Recarregando para recuperar a conexão…');
           log('WebSocket continua fechado; recarregando a página.', 'warn');
           setTimeout(() => location.reload(), 1_000);
         }
       }
+      renderOverlay();
       return;
     }
 
     socketDownSince = 0;
 
     if (!likelyInHunt || !currentHuntSlug) {
-      setStatus(`Conectado · ${currentHuntSlug || 'aguardando hunt'}`);
+      renderOverlay();
       return;
     }
 
     const silence = t - lastHuntActivityAt;
     if (silence < CONFIG.huntSilenceMs) {
-      setStatus(`Hunt normal · ${currentHuntSlug}`);
+      renderOverlay();
       return;
     }
 
-    if (t - lastReconnectAt < CONFIG.reconnectCooldownMs) return;
-    if (reconnectInProgress) return;
-
+    if (t - lastReconnectAt < CONFIG.reconnectCooldownMs || reconnectInProgress) return;
     void rejoinCurrentHunt(`Sem atividade há ${Math.floor(silence / 1000)}s.`);
+    renderOverlay();
+  }
+
+  function clampPosition(left, top, el) {
+    const margin = 8;
+    const maxLeft = Math.max(margin, window.innerWidth - el.offsetWidth - margin);
+    const maxTop = Math.max(margin, window.innerHeight - el.offsetHeight - margin);
+    return {
+      left: Math.min(Math.max(margin, left), maxLeft),
+      top: Math.min(Math.max(margin, top), maxTop)
+    };
+  }
+
+  function makeOverlayDraggable(el) {
+    const startDrag = event => {
+      if (event.button !== 0) return;
+      const rect = el.getBoundingClientRect();
+      dragState = {
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top
+      };
+      el.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    };
+
+    const moveDrag = event => {
+      if (!dragState) return;
+      const position = clampPosition(
+        event.clientX - dragState.offsetX,
+        event.clientY - dragState.offsetY,
+        el
+      );
+      el.style.left = `${position.left}px`;
+      el.style.top = `${position.top}px`;
+      el.style.right = 'auto';
+      el.style.bottom = 'auto';
+    };
+
+    const endDrag = () => {
+      if (!dragState) return;
+      const rect = el.getBoundingClientRect();
+      savePosition(rect.left, rect.top);
+      dragState = null;
+    };
+
+    el.addEventListener('pointerdown', startDrag);
+    el.addEventListener('pointermove', moveDrag);
+    el.addEventListener('pointerup', endDrag);
+    el.addEventListener('pointercancel', endDrag);
   }
 
   function renderOverlay() {
-    let el = document.getElementById(CONFIG.overlayId);
-    if (!el) {
-      el = document.createElement('div');
-      el.id = CONFIG.overlayId;
-      Object.assign(el.style, {
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = CONFIG.overlayId;
+      Object.assign(overlay.style, {
         position: 'fixed',
-        right: '12px',
-        bottom: '12px',
         zIndex: '2147483647',
-        padding: '10px 12px',
+        padding: '8px 10px',
         borderRadius: '8px',
         background: 'rgba(15, 23, 42, 0.94)',
         color: '#fff',
-        font: '12px/1.4 system-ui, sans-serif',
-        minWidth: '220px',
+        font: '12px/1.35 system-ui, sans-serif',
+        minWidth: '118px',
         boxShadow: '0 6px 24px rgba(0,0,0,.35)',
-        pointerEvents: 'none',
-        whiteSpace: 'pre-line'
+        whiteSpace: 'pre-line',
+        cursor: 'move',
+        userSelect: 'none',
+        touchAction: 'none'
       });
+
+      const savedPosition = getPosition();
+      if (savedPosition) {
+        const position = clampPosition(savedPosition.left, savedPosition.top, overlay);
+        overlay.style.left = `${position.left}px`;
+        overlay.style.top = `${position.top}px`;
+      } else {
+        overlay.style.right = '12px';
+        overlay.style.bottom = '12px';
+      }
+
       const host = document.documentElement || document.body;
       if (!host) {
         document.addEventListener('DOMContentLoaded', renderOverlay, { once: true });
         return;
       }
-      host.appendChild(el);
+      host.appendChild(overlay);
+      makeOverlayDraggable(overlay);
     }
 
-    const socketState = isOpen() ? '🟢 conectado' : '🔴 desconectado';
-    el.textContent = [
-      'PIW Auto Reconnect',
-      socketState,
-      `Hunt: ${currentHuntSlug || '—'}`,
-      `Reconexões: ${reconnectCount}`,
-      `Último evento: ${lastMessageType}`,
-      lastStatus
-    ].join('\n');
+    overlay.textContent = `${isOpen() ? '🟢 conectado' : '🔴 desconectado'}\nReconexões: ${reconnectCount}`;
   }
 
   function bootstrap() {
     restoreState();
     renderOverlay();
-    setStatus(currentHuntSlug ? `Estado restaurado · ${currentHuntSlug}` : 'Aguardando hunt…');
-
     window.addEventListener('beforeunload', () => saveState());
+    window.addEventListener('resize', () => {
+      if (!overlay) return;
+      const rect = overlay.getBoundingClientRect();
+      const position = clampPosition(rect.left, rect.top, overlay);
+      overlay.style.left = `${position.left}px`;
+      overlay.style.top = `${position.top}px`;
+      overlay.style.right = 'auto';
+      overlay.style.bottom = 'auto';
+      savePosition(position.left, position.top);
+    });
     setInterval(monitor, CONFIG.checkIntervalMs);
   }
 
