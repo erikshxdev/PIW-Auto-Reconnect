@@ -6,7 +6,7 @@
   "content_scripts": [
     {
       "matches": ["https://poke.idleworld.online/play"],
-      "js": ["reload-recovery.js", "auto-reconnect.js"],
+      "js": ["reload-recovery.js", "auto-reconnect.js", "reload-state.js"],
       "run_at": "document_start",
       "world": "MAIN"
     }
