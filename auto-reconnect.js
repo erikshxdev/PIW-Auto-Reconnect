@@ -1,8 +1,9 @@
 (() => {
   'use strict';
 
-  // PIW Auto Reconnect — independent, minimal implementation.
-  // No external requests, no analytics, no access to cookies/tokens.
+  // PIW Auto Reconnect — independent implementation.
+  // No external requests, analytics, cookies, or credential access.
+  // NOTE: The connection toggle in this version is TEMPORARY test tooling.
 
   const NativeWebSocket = window.WebSocket;
   const nativeSend = NativeWebSocket.prototype.send;
@@ -28,6 +29,7 @@
   ]);
 
   let gameSocket = null;
+  let lastSocketUrl = null;
   let currentHuntSlug = null;
   let lastHuntActivityAt = Date.now();
   let lastReconnectAt = 0;
@@ -38,6 +40,7 @@
   let reconnectCount = 0;
   let overlay = null;
   let dragState = null;
+  let manualDisconnectTest = false;
 
   function now() {
     return Date.now();
@@ -164,8 +167,11 @@
     if (!socket || !String(socket.url || '').includes('/ws')) return socket;
 
     gameSocket = socket;
+    lastSocketUrl = String(socket.url || '');
     socketDownSince = 0;
     reloadScheduled = false;
+    manualDisconnectTest = false;
+    renderOverlay();
 
     const state = getState();
     if (state.reconnectPending === true && state.likelyInHunt === true && currentHuntSlug) {
@@ -184,8 +190,14 @@
         socketDownSince = now();
         if (likelyInHunt && currentHuntSlug) saveState({ reconnectPending: true });
         log('WebSocket da API do jogo caiu.', 'warn');
+        renderOverlay();
       }
     });
+
+    socket.addEventListener('error', () => {
+      if (gameSocket === socket) renderOverlay();
+    });
+
     return socket;
   }
 
@@ -236,6 +248,7 @@
       lastHuntActivityAt = now();
       saveState();
       log(`${reason} Reentrei em ${currentHuntSlug}.`);
+      renderOverlay();
       return true;
     } finally {
       reconnectInProgress = false;
@@ -248,7 +261,7 @@
     if (!isOpen()) {
       if (!socketDownSince) socketDownSince = t;
 
-      if (likelyInHunt && currentHuntSlug) {
+      if (likelyInHunt && currentHuntSlug && !manualDisconnectTest) {
         const downFor = t - socketDownSince;
         if (!reloadScheduled && downFor >= CONFIG.socketReloadDelayMs) {
           reloadScheduled = true;
@@ -291,7 +304,7 @@
 
   function makeOverlayDraggable(el) {
     const startDrag = event => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 || event.target.closest('button')) return;
       const rect = el.getBoundingClientRect();
       dragState = {
         offsetX: event.clientX - rect.left,
@@ -327,6 +340,49 @@
     el.addEventListener('pointercancel', endDrag);
   }
 
+  function createTestButton() {
+    const button = document.createElement('button');
+    button.type = 'button';
+    Object.assign(button.style, {
+      width: '100%',
+      marginTop: '7px',
+      padding: '4px 7px',
+      border: '1px solid rgba(255,255,255,.25)',
+      borderRadius: '5px',
+      background: 'rgba(255,255,255,.10)',
+      color: '#fff',
+      font: '600 11px/1.3 system-ui, sans-serif',
+      cursor: 'pointer',
+      userSelect: 'none'
+    });
+
+    button.addEventListener('pointerdown', event => event.stopPropagation());
+    button.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (isOpen()) {
+        manualDisconnectTest = true;
+        log('TESTE: fechando o WebSocket manualmente.');
+        try {
+          gameSocket.close(1000, 'PIW Auto Reconnect test');
+        } catch (error) {
+          log(`Não foi possível fechar o WebSocket: ${error}`, 'warn');
+          manualDisconnectTest = false;
+        }
+      } else {
+        manualDisconnectTest = false;
+        if (lastSocketUrl) {
+          log('TESTE: solicitando reload manual para restabelecer a conexão.');
+          location.reload();
+        }
+      }
+      renderOverlay();
+    });
+
+    return button;
+  }
+
   function renderOverlay() {
     if (!overlay) {
       overlay = document.createElement('div');
@@ -339,7 +395,7 @@
         background: 'rgba(15, 23, 42, 0.94)',
         color: '#fff',
         font: '12px/1.35 system-ui, sans-serif',
-        minWidth: '118px',
+        minWidth: '125px',
         boxShadow: '0 6px 24px rgba(0,0,0,.35)',
         whiteSpace: 'pre-line',
         cursor: 'move',
@@ -366,12 +422,30 @@
       makeOverlayDraggable(overlay);
     }
 
-    overlay.textContent = `${isOpen() ? '🟢 conectado' : '🔴 desconectado'}\nReconexões: ${reconnectCount}`;
+    overlay.textContent = '';
+
+    const status = document.createElement('div');
+    status.textContent = isOpen() ? '🟢 CONECTADO' : '🔴 DESCONECTADO';
+
+    const count = document.createElement('div');
+    count.textContent = `RECONEXÕES: ${reconnectCount}`;
+
+    if (!overlay.querySelector('button')) overlay.appendChild(status);
+    else overlay.insertBefore(status, overlay.firstChild);
+    overlay.appendChild(count);
+
+    const existingButton = overlay.querySelector('button');
+    if (existingButton) existingButton.remove();
+
+    const testButton = createTestButton();
+    testButton.textContent = isOpen() ? 'DESLIGAR' : 'RELIGAR';
+    overlay.appendChild(testButton);
   }
 
   function bootstrap() {
     restoreState();
     renderOverlay();
+
     window.addEventListener('beforeunload', () => saveState());
     window.addEventListener('resize', () => {
       if (!overlay) return;
@@ -383,6 +457,7 @@
       overlay.style.bottom = 'auto';
       savePosition(position.left, position.top);
     });
+
     setInterval(monitor, CONFIG.checkIntervalMs);
   }
 
