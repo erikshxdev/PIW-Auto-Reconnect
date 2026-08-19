@@ -17,7 +17,7 @@
     socketReloadDelayMs: 45_000,
     confirmationTimeoutMs: 15_000,
     overlayId: 'piw-auto-reconnect-overlay',
-    stateKey: 'piw_auto_reconnect_state_v5',
+    stateKey: 'piw_auto_reconnect_state_v6',
     positionKey: 'piw_auto_reconnect_position_v1',
     enabledKey: 'piw_auto_reconnect_enabled_v1'
   });
@@ -263,11 +263,20 @@
     reconnectInProgress = true;
     lastReconnectAt = currentTime;
     try {
-      if (!sendGameMessage({ type: 'leave-hunt' })) return false;
+      if (!sendGameMessage({ type: 'leave-hunt' })) {
+        lastFailedRejoinAt = now();
+        return false;
+      }
       await new Promise(resolve => setTimeout(resolve, CONFIG.reentryDelayMs));
-      if (!enabled || !isOpen()) return false;
+      if (!enabled || !isOpen()) {
+        lastFailedRejoinAt = now();
+        return false;
+      }
       const entered = sendGameMessage({ type: 'enter-hunt', slug: currentHuntSlug });
-      if (!entered) return false;
+      if (!entered) {
+        lastFailedRejoinAt = now();
+        return false;
+      }
       awaitingRejoinConfirmation = true;
       rejoinConfirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
       lastHuntActivityAt = now();
@@ -433,6 +442,7 @@
   function bootstrap() {
     restoreState();
     enabled = readEnabled();
+    lastCaptureBarSignature = getCaptureBarSignature();
     renderOverlay();
     window.addEventListener('beforeunload', () => saveState());
     window.addEventListener('resize', () => {
