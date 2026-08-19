@@ -4,11 +4,11 @@ Extensão do Google Chrome para monitorar a conexão da Hunt no Poke Idle World 
 
 ## Status
 
-Versão atual: `0.6.0`
+Versão atual: `0.6.1`
 
 Projeto independente e ainda em fase de testes.
 
-## O que a versão 0.6.0 faz
+## O que a versão 0.6.1 faz
 
 - Monitora o WebSocket usado pelo jogo.
 - Usa apenas um conjunto de listeners por WebSocket, evitando duplicação de eventos ao longo da sessão.
@@ -19,7 +19,9 @@ Projeto independente e ainda em fase de testes.
 - Acompanha também mudanças do capture bar.
 - Recupera a Hunt com `leave-hunt` seguido de `enter-hunt`, alinhado ao mecanismo atual do PIW-QOL, sem usar teleporte pelo mapa.
 - Não conta uma reconexão apenas porque `enter-hunt` foi enviado: espera uma confirmação real de progresso da Hunt.
-- Se a tentativa não for confirmada, evita repetir imediatamente a mesma recuperação.
+- Se `leave-hunt` ou `enter-hunt` falhar, a falha entra em cooldown para evitar tentativas repetidas.
+- Se a recuperação não for confirmada, a tentativa também entra em cooldown.
+- Uma reconexão normal do próprio jogo não é interrompida pela extensão.
 - Detecta queda do WebSocket.
 - Usa recarregamento da página como último recurso após uma queda prolongada.
 - Mantém o estado necessário para tentar recuperar a Hunt depois do reload.
