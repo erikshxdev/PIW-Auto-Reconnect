@@ -7,6 +7,7 @@
 
   const NativeWebSocket = window.WebSocket;
   const nativeSend = NativeWebSocket.prototype.send;
+  const trackedSockets = new WeakSet();
 
   const CONFIG = Object.freeze({
     huntSilenceMs: 120_000,
@@ -15,14 +16,14 @@
     checkIntervalMs: 1_000,
     socketReloadDelayMs: 45_000,
     confirmationTimeoutMs: 15_000,
+    confirmationGraceMs: 3_000,
     failedRejoinCooldownMs: 120_000,
     overlayId: 'piw-auto-reconnect-overlay',
-    stateKey: 'piw_auto_reconnect_state_v4',
+    stateKey: 'piw_auto_reconnect_state_v5',
     positionKey: 'piw_auto_reconnect_position_v1',
     enabledKey: 'piw_auto_reconnect_enabled_v1'
   });
 
-  // Same core hunt message set used by PIW-QOL's current Auto Reconnect.
   const HUNT_MESSAGE_TYPES = new Set([
     'field',
     'field-init',
@@ -32,9 +33,6 @@
     'catch-result'
   ]);
 
-  // Strong confirmation signals: deliberately narrower than the generic activity
-  // detector so that `pending` or unrelated messages do not count as a successful
-  // rejoin.
   const STRONG_HUNT_CONFIRM_TYPES = new Set([
     'field-kill',
     'poke-xp',
@@ -51,6 +49,7 @@
   let reconnectInProgress = false;
   let awaitingRejoinConfirmation = false;
   let rejoinConfirmationDeadline = 0;
+  let rejoinStartedAt = 0;
   let rejoinBaselineCaptureSignature = '';
   let likelyInHunt = false;
   let reconnectCount = 0;
@@ -58,6 +57,7 @@
   let overlay = null;
   let dragState = null;
   let lastCaptureBarSignature = '';
+  let recoveryAfterReloadPending = false;
 
   function now() {
     return Date.now();
@@ -69,8 +69,8 @@
     else console.info(prefix, message);
   }
 
-  // sessionStorage is intentionally used for per-tab hunt state. This prevents four
-  // accounts in four tabs of the same Chrome profile from sharing a hunt slug/count.
+  // Hunt state is per-tab so multiple accounts in the same Chrome profile cannot
+  // overwrite each other's slug, counters, or enabled state.
   function getState() {
     try {
       return JSON.parse(sessionStorage.getItem(CONFIG.stateKey) || '{}');
@@ -98,12 +98,12 @@
     if (typeof state.slug === 'string' && state.slug.trim()) currentHuntSlug = state.slug.trim();
     likelyInHunt = state.likelyInHunt === true;
     if (Number.isFinite(state.reconnectCount)) reconnectCount = Math.max(0, state.reconnectCount);
+    recoveryAfterReloadPending = state.reconnectPending === true;
   }
 
   function readEnabled() {
     try {
-      const stored = sessionStorage.getItem(CONFIG.enabledKey);
-      return stored !== 'false';
+      return sessionStorage.getItem(CONFIG.enabledKey) !== 'false';
     } catch {
       return true;
     }
@@ -120,7 +120,10 @@
       awaitingRejoinConfirmation = false;
       reconnectInProgress = false;
       rejoinConfirmationDeadline = 0;
+      recoveryAfterReloadPending = false;
+      saveState({ reconnectPending: false });
     }
+
     renderOverlay();
   }
 
@@ -147,15 +150,12 @@
     return captureBar?.innerHTML || '';
   }
 
-  // Mirrors the current PIW-QOL idea of a real Hunt context, but without depending on
-  // any of PIW-QOL's private helper functions.
+  // Deliberately does not use the Hunt Analyzer alone as proof of Hunt context.
+  // The analyzer can remain open while the character is no longer hunting.
   function isInHuntContext() {
-    if (document.querySelector('[data-guide="capture-bar"], .hunt-ui, .battle-window, .wild-pokemon')) return true;
-
-    const analyzer = document.querySelector('.ha-window:not(.ha-compare-modal)');
-    if (analyzer) return true;
-
-    return false;
+    return Boolean(document.querySelector(
+      '[data-guide="capture-bar"], .hunt-ui, .battle-window, .wild-pokemon'
+    ));
   }
 
   function isHuntProgressMessage(message) {
@@ -178,19 +178,19 @@
   }
 
   function isStrongConfirmationMessage(message) {
-    const type = String(message?.type || '').toLowerCase();
-    return STRONG_HUNT_CONFIRM_TYPES.has(type);
+    return STRONG_HUNT_CONFIRM_TYPES.has(String(message?.type || '').toLowerCase());
   }
 
-  function confirmRejoin() {
+  function confirmRejoin(reason) {
     if (!awaitingRejoinConfirmation) return;
 
     awaitingRejoinConfirmation = false;
     rejoinConfirmationDeadline = 0;
-    reconnectCount += 1;
+    rejoinStartedAt = 0;
     lastFailedRejoinAt = 0;
+    reconnectCount += 1;
     saveState();
-    log(`Reconexão confirmada em ${currentHuntSlug}.`);
+    log(`Reconexão confirmada em ${currentHuntSlug}. ${reason}`);
     renderOverlay();
   }
 
@@ -208,8 +208,13 @@
       lastHuntActivityAt = now();
     }
 
-    if (awaitingRejoinConfirmation && isStrongConfirmationMessage(message)) {
-      if (now() <= rejoinConfirmationDeadline) confirmRejoin();
+    if (
+      awaitingRejoinConfirmation &&
+      isStrongConfirmationMessage(message) &&
+      now() - rejoinStartedAt >= CONFIG.confirmationGraceMs &&
+      now() <= rejoinConfirmationDeadline
+    ) {
+      confirmRejoin(`Evento confirmado: ${type}.`);
     }
 
     if (/leave-hunt|hunt-left|leavehunt/.test(type) && !reconnectInProgress) {
@@ -253,12 +258,25 @@
     reloadScheduled = false;
     renderOverlay();
 
+    // Critical: attach listeners only once per WebSocket instance. The patched send()
+    // method is called for every game message, so re-attaching here would multiply
+    // message/close handlers over time.
+    if (trackedSockets.has(socket)) return socket;
+    trackedSockets.add(socket);
+
     const state = getState();
-    if (state.reconnectPending === true && state.likelyInHunt === true && currentHuntSlug && enabled) {
+    if (
+      recoveryAfterReloadPending &&
+      state.reconnectPending === true &&
+      state.likelyInHunt === true &&
+      currentHuntSlug &&
+      enabled
+    ) {
+      recoveryAfterReloadPending = false;
       saveState({ reconnectPending: false });
       setTimeout(() => {
-        if (enabled && isOpen() && likelyInHunt && currentHuntSlug) {
-          void rejoinCurrentHunt('Reload de recuperação concluído.');
+        if (enabled && isOpen() && currentHuntSlug) {
+          void rejoinCurrentHunt('Recuperação após reload.');
         }
       }, 2_000);
     }
@@ -269,7 +287,7 @@
       if (gameSocket !== socket) return;
       gameSocket = null;
       socketDownSince = now();
-      if (likelyInHunt) saveState({ reconnectPending: enabled });
+      if (likelyInHunt && enabled) saveState({ reconnectPending: true });
       renderOverlay();
       log('WebSocket da API do jogo caiu.', 'warn');
     });
@@ -309,9 +327,10 @@
     }
   }
 
-  async function rejoinCurrentHunt(reason) {
+  async function rejoinCurrentHunt(reason, allowOutsideContext = false) {
     if (!enabled || reconnectInProgress || awaitingRejoinConfirmation || !currentHuntSlug) return false;
-    if (!isOpen() || !likelyInHunt || !isInHuntContext()) return false;
+    if (!isOpen() || !likelyInHunt) return false;
+    if (!allowOutsideContext && !isInHuntContext()) return false;
 
     const currentTime = now();
     if (currentTime - lastFailedRejoinAt < CONFIG.failedRejoinCooldownMs) return false;
@@ -335,9 +354,10 @@
       if (!entered) return false;
 
       awaitingRejoinConfirmation = true;
-      rejoinConfirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
-      lastHuntActivityAt = now();
-      log(`${reason} Reentrando em ${currentHuntSlug}; aguardando atividade real.`);
+      rejoinStartedAt = now();
+      rejoinConfirmationDeadline = rejoinStartedAt + CONFIG.confirmationTimeoutMs;
+      lastHuntActivityAt = rejoinStartedAt;
+      log(`${reason} Reentrando em ${currentHuntSlug}; aguardando confirmação real.`);
       return true;
     } catch (error) {
       lastFailedRejoinAt = now();
@@ -359,15 +379,23 @@
 
     if (awaitingRejoinConfirmation) {
       const currentSignature = getCaptureBarSignature();
-      if (currentSignature && currentSignature !== rejoinBaselineCaptureSignature && now() > rejoinConfirmationDeadline - 14_000) {
-        confirmRejoin();
+      const captureChanged = (
+        t - rejoinStartedAt >= CONFIG.confirmationGraceMs &&
+        currentSignature &&
+        currentSignature !== rejoinBaselineCaptureSignature
+      );
+
+      if (captureChanged && t <= rejoinConfirmationDeadline) {
+        confirmRejoin('Capture bar voltou a mudar.');
+        return;
       }
 
       if (awaitingRejoinConfirmation && t > rejoinConfirmationDeadline) {
         awaitingRejoinConfirmation = false;
         rejoinConfirmationDeadline = 0;
+        rejoinStartedAt = 0;
         lastFailedRejoinAt = t;
-        log('A tentativa de reconexão não foi confirmada; mantendo a contagem inalterada.', 'warn');
+        log('A tentativa de reconexão não foi confirmada; contagem mantida.', 'warn');
         renderOverlay();
       }
       return;
@@ -393,7 +421,7 @@
 
     socketDownSince = 0;
 
-    if (!likelyInHunt || !currentHuntSlug || !isInHuntContext()) {
+    if (!likelyInHunt || !currentHuntSlug) {
       renderOverlay();
       return;
     }
@@ -404,6 +432,14 @@
       lastHuntActivityAt = t;
     }
 
+    // During the normal operation of the game we require a real Hunt context before
+    // initiating leave/enter. This prevents an open analyzer or stale slug from causing
+    // an unintended hunt change while the player is elsewhere.
+    if (!isInHuntContext()) {
+      renderOverlay();
+      return;
+    }
+
     if (t - lastHuntActivityAt < CONFIG.huntSilenceMs) {
       renderOverlay();
       return;
@@ -411,7 +447,9 @@
 
     if (t - lastReconnectAt < CONFIG.reconnectCooldownMs || reconnectInProgress) return;
 
-    void rejoinCurrentHunt(`Hunt sem atividade por ${Math.floor((t - lastHuntActivityAt) / 1000)}s.`);
+    void rejoinCurrentHunt(
+      `Hunt sem atividade por ${Math.floor((t - lastHuntActivityAt) / 1000)}s.`
+    );
     renderOverlay();
   }
 
