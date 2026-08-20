@@ -18,7 +18,7 @@
     confirmationTimeoutMs: 15_000,
     reloadRecoveryDelayMs: 1_500,
     overlayId: 'piw-auto-reconnect-overlay',
-    stateKey: 'piw_auto_reconnect_state_v7',
+    stateKey: 'piw_auto_reconnect_state_v8',
     positionKey: 'piw_auto_reconnect_position_v1',
     enabledKey: 'piw_auto_reconnect_enabled_v1'
   });
@@ -45,6 +45,7 @@
   let lastCaptureBarSignature = '';
   let pendingReloadRecovery = false;
   let reloadRecoveryAttempted = false;
+  let staleSocketEscalationArmed = false;
 
   function now() {
     return Date.now();
@@ -105,6 +106,7 @@
       reconnectInProgress = false;
       rejoinConfirmationDeadline = 0;
       pendingReloadRecovery = false;
+      staleSocketEscalationArmed = false;
     }
     renderOverlay();
   }
@@ -159,6 +161,7 @@
     awaitingRejoinConfirmation = false;
     rejoinConfirmationDeadline = 0;
     lastFailedRejoinAt = 0;
+    staleSocketEscalationArmed = false;
     reconnectCount += 1;
     pendingReloadRecovery = false;
     saveState({ reconnectPending: false });
@@ -211,6 +214,7 @@
   function trackSocket(socket) {
     if (!socket || !String(socket.url || '').includes('/ws')) return socket;
     gameSocket = socket;
+    staleSocketEscalationArmed = false;
     if (trackedSockets.has(socket)) {
       renderOverlay();
       return socket;
@@ -232,6 +236,7 @@
       if (gameSocket !== socket) return;
       gameSocket = null;
       socketDownSince = now();
+      staleSocketEscalationArmed = false;
       renderOverlay();
       log('WebSocket da API do jogo caiu.', 'warn');
     });
@@ -331,6 +336,7 @@
       awaitingRejoinConfirmation = true;
       rejoinConfirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
       lastHuntActivityAt = now();
+      staleSocketEscalationArmed = true;
       log(`${reason} Reentrando em ${currentHuntSlug}; aguardando confirmação.`);
       return true;
     } catch (error) {
@@ -340,6 +346,20 @@
     } finally {
       reconnectInProgress = false;
       renderOverlay();
+    }
+  }
+
+  function escalateStaleSocket() {
+    if (!enabled || !staleSocketEscalationArmed || !isOpen() || !likelyInHunt || !currentHuntSlug) return;
+    staleSocketEscalationArmed = false;
+    pendingReloadRecovery = true;
+    saveState({ reconnectPending: true });
+    lastFailedRejoinAt = now();
+    log('Hunt não confirmou a recuperação; fechando WebSocket potencialmente travado.', 'warn');
+    try {
+      gameSocket.close(4001, 'PIW Auto Reconnect stale hunt recovery');
+    } catch (error) {
+      log(`Não foi possível fechar o WebSocket travado: ${error}`, 'warn');
     }
   }
 
@@ -354,8 +374,7 @@
       if (t > rejoinConfirmationDeadline) {
         awaitingRejoinConfirmation = false;
         rejoinConfirmationDeadline = 0;
-        lastFailedRejoinAt = t;
-        log('Reconexão não confirmada; nenhuma reconexão foi contabilizada.', 'warn');
+        if (staleSocketEscalationArmed) escalateStaleSocket();
         renderOverlay();
       }
       return;
