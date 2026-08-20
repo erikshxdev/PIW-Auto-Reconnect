@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
   "name": "PIW Auto Reconnect",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Monitora a hunt do Poke Idle World e tenta recuperá-la quando o WebSocket trava.",
   "content_scripts": [
     {
       "matches": ["https://poke.idleworld.online/play"],
-      "js": ["reload-recovery.js", "auto-reconnect.js", "reload-state.js"],
+      "js": ["auto-reconnect.js"],
       "run_at": "document_start",
       "world": "MAIN"
     }
