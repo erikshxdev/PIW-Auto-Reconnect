@@ -1,63 +1,69 @@
 (() => {
   'use strict';
 
-  // PIW Auto Reconnect — independent implementation.
-  // Only monitors the game's WebSocket and hunt state.
-  // No external requests, analytics, cookies, or credential access.
+  // PIW Auto Reconnect — only the reconnect mechanism.
+  // Recovery flow follows PIW-QOL 10.1.0, with a deliberate 2-minute hunt timeout.
 
   const NativeWebSocket = window.WebSocket;
   const nativeSend = NativeWebSocket.prototype.send;
+  const trackedSockets = new WeakSet();
 
   const CONFIG = Object.freeze({
     huntSilenceMs: 120_000,
     reentryDelayMs: 500,
-    reconnectCooldownMs: 10_000,
-    failedRejoinCooldownMs: 120_000,
-    checkIntervalMs: 1_000,
+    reconnectCooldownMs: 5_000,
     socketReloadDelayMs: 45_000,
-    confirmationTimeoutMs: 15_000,
     reloadRecoveryDelayMs: 1_500,
-    overlayId: 'piw-auto-reconnect-overlay',
-    stateKey: 'piw_auto_reconnect_state_v8',
+    confirmationTimeoutMs: 15_000,
+    checkIntervalMs: 1_000,
+    stateKey: 'piw_auto_reconnect_state_v10',
     positionKey: 'piw_auto_reconnect_position_v1',
-    enabledKey: 'piw_auto_reconnect_enabled_v1'
+    overlayId: 'piw-auto-reconnect-overlay'
   });
 
-  const HUNT_MESSAGE_TYPES = new Set(['field', 'field-init', 'field-kill', 'poke-xp', 'pending', 'catch-result']);
-  const STRONG_CONFIRM_TYPES = new Set(['field-kill', 'poke-xp', 'catch-result']);
-  const trackedSockets = new WeakSet();
+  const HUNT_MESSAGE_TYPES = new Set([
+    'field',
+    'field-init',
+    'field-kill',
+    'poke-xp',
+    'pending',
+    'catch-result'
+  ]);
+
+  const STRONG_CONFIRM_TYPES = new Set([
+    'field-kill',
+    'poke-xp',
+    'catch-result'
+  ]);
 
   let gameSocket = null;
   let currentHuntSlug = null;
-  let lastHuntActivityAt = Date.now();
-  let lastReconnectAt = 0;
-  let lastFailedRejoinAt = 0;
+  let lastHuntSocketActivityAt = Date.now();
+  let lastCaptureBarSignature = '';
+  let lastAutoReconnectAt = 0;
+  let autoReconnectInProgress = false;
+  let autoReconnectWasInHunt = false;
   let socketDownSince = 0;
   let reloadScheduled = false;
-  let reconnectInProgress = false;
-  let awaitingRejoinConfirmation = false;
-  let rejoinConfirmationDeadline = 0;
-  let likelyInHunt = false;
+  let reloadRecoveryPending = false;
+  let reloadRecoveryAttempted = false;
+  let awaitingConfirmation = false;
+  let confirmationDeadline = 0;
   let reconnectCount = 0;
-  let enabled = true;
+
   let overlay = null;
   let dragState = null;
-  let lastCaptureBarSignature = '';
-  let pendingReloadRecovery = false;
-  let reloadRecoveryAttempted = false;
-  let staleSocketEscalationArmed = false;
 
   function now() {
     return Date.now();
   }
 
-  function log(message, level = 'info') {
+  function log(message, warning = false) {
     const prefix = '[PIW Auto Reconnect]';
-    if (level === 'warn') console.warn(prefix, message);
-    else console.info(prefix, message);
+    (warning ? console.warn : console.info)(prefix, message);
   }
 
-  function getState() {
+  function readState() {
     try {
       return JSON.parse(sessionStorage.getItem(CONFIG.stateKey) || '{}');
     } catch {
@@ -69,52 +75,31 @@
     try {
       sessionStorage.setItem(CONFIG.stateKey, JSON.stringify({
         slug: currentHuntSlug,
-        likelyInHunt,
         reconnectCount,
         updatedAt: now(),
         ...extra
       }));
     } catch (error) {
-      log(`Não foi possível salvar estado: ${error}`, 'warn');
+      log(`Falha ao salvar estado: ${error}`, true);
     }
   }
 
   function restoreState() {
-    const state = getState();
-    if (typeof state.slug === 'string' && state.slug.trim()) currentHuntSlug = state.slug.trim();
-    likelyInHunt = state.likelyInHunt === true;
-    if (Number.isFinite(state.reconnectCount)) reconnectCount = Math.max(0, state.reconnectCount);
-    pendingReloadRecovery = state.reconnectPending === true;
-  }
-
-  function readEnabled() {
-    try {
-      return sessionStorage.getItem(CONFIG.enabledKey) !== 'false';
-    } catch {
-      return true;
+    const state = readState();
+    if (typeof state.slug === 'string' && state.slug.trim()) {
+      currentHuntSlug = state.slug.trim();
     }
-  }
-
-  function saveEnabled(value) {
-    enabled = Boolean(value);
-    try {
-      sessionStorage.setItem(CONFIG.enabledKey, String(enabled));
-    } catch {}
-    if (!enabled) {
-      reloadScheduled = false;
-      awaitingRejoinConfirmation = false;
-      reconnectInProgress = false;
-      rejoinConfirmationDeadline = 0;
-      pendingReloadRecovery = false;
-      staleSocketEscalationArmed = false;
+    if (Number.isFinite(state.reconnectCount)) {
+      reconnectCount = Math.max(0, state.reconnectCount);
     }
-    renderOverlay();
+    reloadRecoveryPending = state.reconnectPending === true;
+    autoReconnectWasInHunt = state.reconnectPending === true && Boolean(currentHuntSlug);
   }
 
   function getPosition() {
     try {
-      const position = JSON.parse(localStorage.getItem(CONFIG.positionKey) || '{}');
-      if (Number.isFinite(position.left) && Number.isFinite(position.top)) return position;
+      const value = JSON.parse(localStorage.getItem(CONFIG.positionKey) || '{}');
+      if (Number.isFinite(value.left) && Number.isFinite(value.top)) return value;
     } catch {}
     return null;
   }
@@ -125,25 +110,35 @@
     } catch {}
   }
 
-  function isOpen() {
+  function isSocketOpen() {
     return Boolean(gameSocket && gameSocket.readyState === NativeWebSocket.OPEN);
   }
 
+  // Primary Hunt selectors match PIW-QOL. The remembered slug is used as a fallback
+  // during reconnect/reload before the game's Hunt UI has rendered again.
   function isInHuntContext() {
-    return Boolean(document.querySelector('[data-guide="capture-bar"], .hunt-ui, .battle-window, .wild-pokemon'));
+    if (document.querySelector('[data-guide="capture-bar"], .hunt-ui, .battle-window, .wild-pokemon')) {
+      return true;
+    }
+
+    if (currentHuntSlug && autoReconnectWasInHunt) {
+      const analyzer = document.querySelector('.ha-window:not(.ha-compare-modal)');
+      return Boolean(analyzer) || Boolean(reloadRecoveryPending);
+    }
+
+    return false;
   }
 
   function getCaptureBarSignature() {
-    const captureBar = document.querySelector('[data-guide="capture-bar"]');
-    return captureBar?.innerHTML || '';
+    return document.querySelector('[data-guide="capture-bar"]')?.innerHTML || '';
   }
 
-  function isHuntActivityMessage(message) {
+  function isHuntProgressMessage(message) {
     const type = String(message?.type || '').toLowerCase();
     if (!type) return false;
-    if (HUNT_MESSAGE_TYPES.has(type)) return true;
     if (/chat|family|friend|ranking|pong|ping|inventory|pokes-get/.test(type)) return false;
     if (/exp|xp|defeat|kill|loot|drop|capture|catch|damage|attack/.test(type)) return true;
+
     try {
       const payload = JSON.stringify(message).toLowerCase();
       return /"(?:expgained|xpgain|xp|experience|defeated|killed|damage|loot|drops?|reward)"\s*:\s*(?:[1-9]\d*|true|\[|\{)/.test(payload);
@@ -152,21 +147,8 @@
     }
   }
 
-  function isStrongConfirmationMessage(message) {
-    return STRONG_CONFIRM_TYPES.has(String(message?.type || '').toLowerCase());
-  }
-
-  function confirmRejoin() {
-    if (!awaitingRejoinConfirmation) return;
-    awaitingRejoinConfirmation = false;
-    rejoinConfirmationDeadline = 0;
-    lastFailedRejoinAt = 0;
-    staleSocketEscalationArmed = false;
-    reconnectCount += 1;
-    pendingReloadRecovery = false;
-    saveState({ reconnectPending: false });
-    log(`Reconexão confirmada em ${currentHuntSlug}.`);
-    renderOverlay();
+  function isHuntSocketMessage(message) {
+    return HUNT_MESSAGE_TYPES.has(String(message?.type || '').toLowerCase()) || isHuntProgressMessage(message);
   }
 
   function observeIncoming(event) {
@@ -177,18 +159,22 @@
       return;
     }
 
-    if (isHuntActivityMessage(message)) lastHuntActivityAt = now();
-    if (awaitingRejoinConfirmation && isStrongConfirmationMessage(message) && now() <= rejoinConfirmationDeadline) confirmRejoin();
+    if (isHuntSocketMessage(message)) {
+      lastHuntSocketActivityAt = now();
+    }
 
-    const type = String(message?.type || '').toLowerCase();
-    if (/leave-hunt|hunt-left|leavehunt/.test(type) && !reconnectInProgress) {
-      likelyInHunt = false;
-      saveState({ reconnectPending: false });
+    if (
+      awaitingConfirmation &&
+      now() <= confirmationDeadline &&
+      STRONG_CONFIRM_TYPES.has(String(message?.type || '').toLowerCase())
+    ) {
+      confirmReconnect();
     }
   }
 
   function observeOutgoing(socket, data) {
     if (!socket || !String(socket.url || '').includes('/ws') || typeof data !== 'string') return;
+
     let message;
     try {
       message = JSON.parse(data);
@@ -197,61 +183,77 @@
     }
 
     const type = String(message?.type || '').toLowerCase();
+
     if (type === 'enter-hunt' && message.slug) {
       currentHuntSlug = String(message.slug).trim();
-      likelyInHunt = true;
-      if (!reconnectInProgress) lastHuntActivityAt = now();
+      autoReconnectWasInHunt = true;
+      lastHuntSocketActivityAt = now();
       socketDownSince = 0;
-      if (!reconnectInProgress) saveState({ reconnectPending: false });
+      reloadRecoveryPending = false;
+      saveState({ reconnectPending: false });
       return;
     }
-    if (type === 'leave-hunt' && !reconnectInProgress) {
-      likelyInHunt = false;
+
+    if (type === 'leave-hunt' && !autoReconnectInProgress) {
+      autoReconnectWasInHunt = false;
       saveState({ reconnectPending: false });
     }
   }
 
   function trackSocket(socket) {
     if (!socket || !String(socket.url || '').includes('/ws')) return socket;
+
     gameSocket = socket;
-    staleSocketEscalationArmed = false;
+
     if (trackedSockets.has(socket)) {
       renderOverlay();
       return socket;
     }
+
     trackedSockets.add(socket);
     socketDownSince = 0;
     reloadScheduled = false;
 
     socket.addEventListener('message', observeIncoming);
+
     socket.addEventListener('open', () => {
       if (gameSocket !== socket) return;
       socketDownSince = 0;
       renderOverlay();
-      if (pendingReloadRecovery && !reloadRecoveryAttempted) {
+
+      if (reloadRecoveryPending && !reloadRecoveryAttempted) {
         void recoverAfterReload(socket);
       }
     });
+
     socket.addEventListener('close', () => {
       if (gameSocket !== socket) return;
       gameSocket = null;
       socketDownSince = now();
-      staleSocketEscalationArmed = false;
       renderOverlay();
-      log('WebSocket da API do jogo caiu.', 'warn');
+      log('WebSocket do jogo caiu.', true);
     });
+
     socket.addEventListener('error', () => {
       if (gameSocket === socket) renderOverlay();
     });
-    if (socket.readyState === NativeWebSocket.OPEN && pendingReloadRecovery && !reloadRecoveryAttempted) {
+
+    if (
+      socket.readyState === NativeWebSocket.OPEN &&
+      reloadRecoveryPending &&
+      !reloadRecoveryAttempted
+    ) {
       void recoverAfterReload(socket);
     }
+
     renderOverlay();
     return socket;
   }
 
   function TrackedWebSocket(url, protocols) {
-    const socket = protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+    const socket = protocols === undefined
+      ? new NativeWebSocket(url)
+      : new NativeWebSocket(url, protocols);
     return trackSocket(socket);
   }
 
@@ -259,6 +261,7 @@
   Object.setPrototypeOf(TrackedWebSocket, NativeWebSocket);
   window.WebSocket = TrackedWebSocket;
 
+  // Same mechanism PIW-QOL uses to observe the game's enter-hunt message.
   NativeWebSocket.prototype.send = function patchedSend(data) {
     trackSocket(this);
     observeOutgoing(this, data);
@@ -266,137 +269,150 @@
   };
 
   function sendGameMessage(message) {
-    if (!isOpen()) return false;
+    if (!isSocketOpen()) return false;
     try {
       gameSocket.send(JSON.stringify(message));
       return true;
     } catch (error) {
-      log(`Falha ao enviar ${message.type}: ${error}`, 'warn');
+      log(`Falha ao enviar ${message.type}: ${error}`, true);
       return false;
     }
   }
 
+  async function waitForGameSocket(timeoutMs = 5_000) {
+    const deadline = now() + timeoutMs;
+    while (now() < deadline) {
+      if (isSocketOpen()) return true;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return isSocketOpen();
+  }
+
   async function recoverAfterReload(socket) {
-    if (!enabled || reloadRecoveryAttempted || !pendingReloadRecovery) return false;
-    if (!currentHuntSlug || !likelyInHunt) return false;
+    if (reloadRecoveryAttempted || !reloadRecoveryPending) return false;
+    if (!currentHuntSlug || !autoReconnectWasInHunt) return false;
     if (socket.readyState !== NativeWebSocket.OPEN) return false;
 
     reloadRecoveryAttempted = true;
-    reconnectInProgress = true;
+    autoReconnectInProgress = true;
+
     try {
       await new Promise(resolve => setTimeout(resolve, CONFIG.reloadRecoveryDelayMs));
-      if (!enabled || socket.readyState !== NativeWebSocket.OPEN) {
-        lastFailedRejoinAt = now();
-        return false;
-      }
+      if (!await waitForGameSocket(5_000)) return false;
+
       const entered = sendGameMessage({ type: 'enter-hunt', slug: currentHuntSlug });
-      if (!entered) {
-        lastFailedRejoinAt = now();
-        return false;
-      }
-      awaitingRejoinConfirmation = true;
-      rejoinConfirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
-      lastHuntActivityAt = now();
-      log(`Recuperação pós-reload iniciada em ${currentHuntSlug}; aguardando confirmação.`);
+      if (!entered) return false;
+
+      awaitingConfirmation = true;
+      confirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
+      lastHuntSocketActivityAt = now();
+      log(`Recuperação pós-reload iniciada em ${currentHuntSlug}.`);
       return true;
     } catch (error) {
-      lastFailedRejoinAt = now();
-      log(`Falha na recuperação pós-reload: ${error}`, 'warn');
+      log(`Falha na recuperação pós-reload: ${error}`, true);
       return false;
     } finally {
-      reconnectInProgress = false;
+      autoReconnectInProgress = false;
       renderOverlay();
     }
   }
 
   async function rejoinCurrentHunt(reason) {
-    if (!enabled || reconnectInProgress || awaitingRejoinConfirmation) return false;
-    if (!currentHuntSlug || !likelyInHunt || !isOpen() || !isInHuntContext()) return false;
-    const currentTime = now();
-    if (currentTime - lastReconnectAt < CONFIG.reconnectCooldownMs) return false;
-    if (currentTime - lastFailedRejoinAt < CONFIG.failedRejoinCooldownMs) return false;
+    if (autoReconnectInProgress || awaitingConfirmation) return false;
+    if (!currentHuntSlug || !autoReconnectWasInHunt || !isSocketOpen()) return false;
 
-    reconnectInProgress = true;
-    lastReconnectAt = currentTime;
+    const currentTime = now();
+    if (currentTime - lastAutoReconnectAt < CONFIG.reconnectCooldownMs) return false;
+
+    autoReconnectInProgress = true;
+    lastAutoReconnectAt = currentTime;
+
     try {
-      if (!sendGameMessage({ type: 'leave-hunt' })) {
-        lastFailedRejoinAt = now();
-        return false;
-      }
+      if (!sendGameMessage({ type: 'leave-hunt' })) return false;
+
       await new Promise(resolve => setTimeout(resolve, CONFIG.reentryDelayMs));
-      if (!enabled || !isOpen()) {
-        lastFailedRejoinAt = now();
-        return false;
-      }
+      if (!await waitForGameSocket(5_000)) return false;
+
       const entered = sendGameMessage({ type: 'enter-hunt', slug: currentHuntSlug });
-      if (!entered) {
-        lastFailedRejoinAt = now();
-        return false;
-      }
-      awaitingRejoinConfirmation = true;
-      rejoinConfirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
-      lastHuntActivityAt = now();
-      staleSocketEscalationArmed = true;
-      log(`${reason} Reentrando em ${currentHuntSlug}; aguardando confirmação.`);
+      if (!entered) return false;
+
+      awaitingConfirmation = true;
+      confirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
+      lastHuntSocketActivityAt = now();
+      lastCaptureBarSignature = getCaptureBarSignature();
+
+      log(`${reason} Reentrei em ${currentHuntSlug}.`);
       return true;
     } catch (error) {
-      lastFailedRejoinAt = now();
-      log(`Falha na recuperação: ${error}`, 'warn');
+      log(`Falha na recuperação: ${error}`, true);
       return false;
     } finally {
-      reconnectInProgress = false;
+      autoReconnectInProgress = false;
       renderOverlay();
     }
   }
 
-  function escalateStaleSocket() {
-    if (!enabled || !staleSocketEscalationArmed || !isOpen() || !likelyInHunt || !currentHuntSlug) return;
-    staleSocketEscalationArmed = false;
-    pendingReloadRecovery = true;
-    saveState({ reconnectPending: true });
-    lastFailedRejoinAt = now();
-    log('Hunt não confirmou a recuperação; fechando WebSocket potencialmente travado.', 'warn');
-    try {
-      gameSocket.close(4001, 'PIW Auto Reconnect stale hunt recovery');
-    } catch (error) {
-      log(`Não foi possível fechar o WebSocket travado: ${error}`, 'warn');
-    }
+  function confirmReconnect() {
+    awaitingConfirmation = false;
+    confirmationDeadline = 0;
+    reloadRecoveryPending = false;
+    reloadRecoveryAttempted = false;
+    reconnectCount += 1;
+    saveState({ reconnectPending: false });
+    log(`Reconexão confirmada em ${currentHuntSlug}.`);
+    renderOverlay();
   }
 
   function monitor() {
     const t = now();
-    if (!enabled) {
+
+    if (awaitingConfirmation) {
+      if (t > confirmationDeadline) {
+        awaitingConfirmation = false;
+        confirmationDeadline = 0;
+        log('Reconexão não confirmada.', true);
+      }
       renderOverlay();
       return;
     }
 
-    if (awaitingRejoinConfirmation) {
-      if (t > rejoinConfirmationDeadline) {
-        awaitingRejoinConfirmation = false;
-        rejoinConfirmationDeadline = 0;
-        if (staleSocketEscalationArmed) escalateStaleSocket();
-        renderOverlay();
-      }
-      return;
-    }
-
-    if (!isOpen()) {
+    // PIW-QOL waits for a long socket-down window before reloading, allowing the
+    // game's own reconnect mechanism to recover first.
+    if (!isSocketOpen()) {
       if (!socketDownSince) socketDownSince = t;
-      if (likelyInHunt && currentHuntSlug && !reloadScheduled && t - socketDownSince >= CONFIG.socketReloadDelayMs) {
+
+      if (
+        autoReconnectWasInHunt &&
+        currentHuntSlug &&
+        !reloadScheduled &&
+        t - socketDownSince >= CONFIG.socketReloadDelayMs
+      ) {
         reloadScheduled = true;
-        pendingReloadRecovery = true;
+        reloadRecoveryPending = true;
         saveState({ reconnectPending: true });
-        log('WebSocket continua fechado; recarregando a página para tentar restaurar a Hunt.', 'warn');
+        log('WebSocket continua fechado; recarregando a página.', true);
         setTimeout(() => {
-          if (enabled && pendingReloadRecovery) location.reload();
-        }, 1_000);
+          if (reloadRecoveryPending) location.reload();
+        }, 1_500);
       }
+
       renderOverlay();
       return;
     }
 
     socketDownSince = 0;
-    if (!likelyInHunt || !currentHuntSlug || !isInHuntContext()) {
+
+    const inHunt = isInHuntContext();
+    if (!inHunt) {
+      autoReconnectWasInHunt = false;
+      renderOverlay();
+      return;
+    }
+
+    if (!autoReconnectWasInHunt) {
+      autoReconnectWasInHunt = true;
+      lastHuntSocketActivityAt = t;
+      lastCaptureBarSignature = getCaptureBarSignature();
       renderOverlay();
       return;
     }
@@ -404,16 +420,16 @@
     const captureBarSignature = getCaptureBarSignature();
     if (captureBarSignature && captureBarSignature !== lastCaptureBarSignature) {
       lastCaptureBarSignature = captureBarSignature;
-      lastHuntActivityAt = t;
+      lastHuntSocketActivityAt = t;
     }
 
-    const silence = t - lastHuntActivityAt;
+    const silence = t - lastHuntSocketActivityAt;
     if (silence < CONFIG.huntSilenceMs) {
       renderOverlay();
       return;
     }
 
-    void rejoinCurrentHunt(`Hunt sem atividade por ${Math.floor(silence / 1000)}s.`);
+    void rejoinCurrentHunt(`Hunt sem progresso por ${Math.floor(silence / 1000)}s.`);
     renderOverlay();
   }
 
@@ -421,123 +437,113 @@
     const margin = 8;
     const maxLeft = Math.max(margin, window.innerWidth - el.offsetWidth - margin);
     const maxTop = Math.max(margin, window.innerHeight - el.offsetHeight - margin);
-    return { left: Math.min(Math.max(margin, left), maxLeft), top: Math.min(Math.max(margin, top), maxTop) };
+    return {
+      left: Math.min(Math.max(margin, left), maxLeft),
+      top: Math.min(Math.max(margin, top), maxTop)
+    };
   }
 
   function makeOverlayDraggable(el) {
     const startDrag = event => {
-      const target = event.target;
-      if (event.button !== 0 || (target instanceof Element && target.closest('button'))) return;
+      if (event.button !== 0) return;
       const rect = el.getBoundingClientRect();
-      dragState = { offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+      dragState = {
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top
+      };
       el.setPointerCapture?.(event.pointerId);
       event.preventDefault();
     };
+
     const moveDrag = event => {
       if (!dragState) return;
-      const position = clampPosition(event.clientX - dragState.offsetX, event.clientY - dragState.offsetY, el);
+      const position = clampPosition(
+        event.clientX - dragState.offsetX,
+        event.clientY - dragState.offsetY,
+        el
+      );
       el.style.left = `${position.left}px`;
       el.style.top = `${position.top}px`;
       el.style.right = 'auto';
       el.style.bottom = 'auto';
     };
+
     const endDrag = () => {
       if (!dragState) return;
       const rect = el.getBoundingClientRect();
       savePosition(rect.left, rect.top);
       dragState = null;
     };
+
     el.addEventListener('pointerdown', startDrag);
     el.addEventListener('pointermove', moveDrag);
     el.addEventListener('pointerup', endDrag);
     el.addEventListener('pointercancel', endDrag);
   }
 
-  function createToggleButton() {
-    const button = document.createElement('button');
-    button.type = 'button';
-    Object.assign(button.style, {
-      width: '100%', marginTop: '7px', padding: '4px 7px',
-      border: '1px solid rgba(255,255,255,.25)', borderRadius: '5px',
-      background: 'rgba(255,255,255,.10)', color: '#fff',
-      font: '600 10px/1.3 system-ui, sans-serif', cursor: 'pointer', userSelect: 'none'
-    });
-    button.addEventListener('pointerdown', event => event.stopPropagation());
-    button.addEventListener('click', event => {
-      event.preventDefault();
-      event.stopPropagation();
-      saveEnabled(!enabled);
-      log(`AUTO RECONNECT ${enabled ? 'LIGADO' : 'DESLIGADO'}.`);
-    });
-    return button;
-  }
-
   function renderOverlay() {
     if (!overlay) {
       overlay = document.createElement('div');
       overlay.id = CONFIG.overlayId;
+
       Object.assign(overlay.style, {
-        position: 'fixed', zIndex: '2147483647', padding: '8px 10px',
-        borderRadius: '8px', background: 'rgba(15, 23, 42, 0.94)', color: '#fff',
-        font: '12px/1.35 system-ui, sans-serif', minWidth: '130px',
-        boxShadow: '0 6px 24px rgba(0,0,0,.35)', whiteSpace: 'pre-line',
-        cursor: 'move', userSelect: 'none', touchAction: 'none'
+        position: 'fixed',
+        zIndex: '2147483647',
+        padding: '8px 10px',
+        borderRadius: '8px',
+        background: 'rgba(15, 23, 42, 0.94)',
+        color: '#fff',
+        font: '12px/1.35 system-ui, sans-serif',
+        minWidth: '125px',
+        boxShadow: '0 6px 24px rgba(0,0,0,.35)',
+        cursor: 'move',
+        userSelect: 'none',
+        touchAction: 'none'
       });
-      const savedPosition = getPosition();
-      if (savedPosition) {
-        const position = clampPosition(savedPosition.left, savedPosition.top, overlay);
-        overlay.style.left = `${position.left}px`;
-        overlay.style.top = `${position.top}px`;
+
+      const saved = getPosition();
+      if (saved) {
+        overlay.style.left = `${saved.left}px`;
+        overlay.style.top = `${saved.top}px`;
       } else {
         overlay.style.right = '12px';
         overlay.style.bottom = '12px';
       }
+
       const host = document.documentElement || document.body;
       if (!host) {
         document.addEventListener('DOMContentLoaded', renderOverlay, { once: true });
         return;
       }
+
       host.appendChild(overlay);
       makeOverlayDraggable(overlay);
     }
 
     overlay.textContent = '';
+
     const status = document.createElement('div');
-    status.textContent = isOpen() ? '🟢 CONECTADO' : '🔴 DESCONECTADO';
+    status.textContent = isSocketOpen() ? '🟢 CONECTADO' : '🔴 DESCONECTADO';
+
     const count = document.createElement('div');
     count.textContent = `RECONEXÕES: ${reconnectCount}`;
-    const toggle = createToggleButton();
-    toggle.textContent = enabled ? 'AUTO RECONNECT: ON' : 'AUTO RECONNECT: OFF';
+
     overlay.appendChild(status);
     overlay.appendChild(count);
-    overlay.appendChild(toggle);
   }
 
   function bootstrap() {
     restoreState();
-    enabled = readEnabled();
     lastCaptureBarSignature = getCaptureBarSignature();
-    renderOverlay();
 
+    // Preserve the last hunt across a reload triggered by the reconnect fallback.
     window.addEventListener('beforeunload', () => {
-      if (enabled && likelyInHunt && currentHuntSlug && (reloadScheduled || socketDownSince > 0 || pendingReloadRecovery)) {
+      if (autoReconnectWasInHunt && currentHuntSlug) {
         saveState({ reconnectPending: true });
-      } else {
-        saveState();
       }
     });
 
-    window.addEventListener('resize', () => {
-      if (!overlay) return;
-      const rect = overlay.getBoundingClientRect();
-      const position = clampPosition(rect.left, rect.top, overlay);
-      overlay.style.left = `${position.left}px`;
-      overlay.style.top = `${position.top}px`;
-      overlay.style.right = 'auto';
-      overlay.style.bottom = 'auto';
-      savePosition(position.left, position.top);
-    });
-
+    renderOverlay();
     setInterval(monitor, CONFIG.checkIntervalMs);
   }
 
