@@ -4,29 +4,26 @@ Extensão do Google Chrome para o Poke Idle World focada exclusivamente em Auto 
 
 ## Status
 
-Versão atual: `0.7.0`
+Versão atual: `0.8.0`
 
 Projeto independente e ainda em testes.
 
 ## Como funciona
 
-A lógica central segue o fluxo de Auto Reconnect usado pelo PIW-QOL 10.1.0:
+A lógica monitora o WebSocket do jogo e acompanha sinais de atividade da Hunt.
 
-- monitora o WebSocket da API do jogo;
 - identifica a Hunt pelo `enter-hunt` enviado pelo próprio jogo;
-- acompanha mensagens de progresso da Hunt e mudanças do capture bar;
-- considera a Hunt potencialmente travada após `2 minutos` sem progresso;
-- tenta `leave-hunt` seguido de `enter-hunt` com o mesmo slug;
-- aguarda confirmação de progresso antes de contabilizar a reconexão;
-- quando o WebSocket permanece fechado, espera `45 segundos` antes do reload;
-- preserva o slug e o contador por aba para sobreviver ao reload;
-- após o reload, aguarda o novo WebSocket e tenta reentrar na Hunt.
-
-A diferença deliberada em relação ao PIW-QOL é o tempo de inatividade: `2 minutos` em vez de `10 segundos`.
+- acompanha mensagens de progresso e mudanças do capture bar;
+- considera a Hunt potencialmente travada após `1 minuto` sem progresso;
+- em uma Hunt travada, salva o slug por aba e executa `F5`;
+- após o reload causado pela extensão, espera o novo WebSocket ficar disponível e envia `enter-hunt` com o mesmo slug;
+- aguarda uma confirmação real de progresso antes de incrementar `RECONEXÕES`;
+- se o WebSocket cair completamente, ainda permite uma janela de `45 segundos` para a reconexão normal do próprio jogo antes de usar o reload;
+- um `F5` manual não cria uma recuperação automática, porque somente reloads marcados pela extensão ficam com `reconnectPending`.
 
 ## Painel
 
-O painel foi mantido propositalmente simples:
+O painel é propositalmente simples:
 
 ```text
 🟢 CONECTADO
