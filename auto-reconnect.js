@@ -16,8 +16,9 @@
     checkIntervalMs: 1_000,
     socketReloadDelayMs: 45_000,
     confirmationTimeoutMs: 15_000,
+    reloadRecoveryDelayMs: 1_500,
     overlayId: 'piw-auto-reconnect-overlay',
-    stateKey: 'piw_auto_reconnect_state_v6',
+    stateKey: 'piw_auto_reconnect_state_v7',
     positionKey: 'piw_auto_reconnect_position_v1',
     enabledKey: 'piw_auto_reconnect_enabled_v1'
   });
@@ -42,6 +43,8 @@
   let overlay = null;
   let dragState = null;
   let lastCaptureBarSignature = '';
+  let pendingReloadRecovery = false;
+  let reloadRecoveryAttempted = false;
 
   function now() {
     return Date.now();
@@ -80,6 +83,7 @@
     if (typeof state.slug === 'string' && state.slug.trim()) currentHuntSlug = state.slug.trim();
     likelyInHunt = state.likelyInHunt === true;
     if (Number.isFinite(state.reconnectCount)) reconnectCount = Math.max(0, state.reconnectCount);
+    pendingReloadRecovery = state.reconnectPending === true;
   }
 
   function readEnabled() {
@@ -100,6 +104,7 @@
       awaitingRejoinConfirmation = false;
       reconnectInProgress = false;
       rejoinConfirmationDeadline = 0;
+      pendingReloadRecovery = false;
     }
     renderOverlay();
   }
@@ -155,7 +160,8 @@
     rejoinConfirmationDeadline = 0;
     lastFailedRejoinAt = 0;
     reconnectCount += 1;
-    saveState();
+    pendingReloadRecovery = false;
+    saveState({ reconnectPending: false });
     log(`Reconexão confirmada em ${currentHuntSlug}.`);
     renderOverlay();
   }
@@ -212,7 +218,16 @@
     trackedSockets.add(socket);
     socketDownSince = 0;
     reloadScheduled = false;
+
     socket.addEventListener('message', observeIncoming);
+    socket.addEventListener('open', () => {
+      if (gameSocket !== socket) return;
+      socketDownSince = 0;
+      renderOverlay();
+      if (pendingReloadRecovery && !reloadRecoveryAttempted) {
+        void recoverAfterReload(socket);
+      }
+    });
     socket.addEventListener('close', () => {
       if (gameSocket !== socket) return;
       gameSocket = null;
@@ -223,6 +238,9 @@
     socket.addEventListener('error', () => {
       if (gameSocket === socket) renderOverlay();
     });
+    if (socket.readyState === NativeWebSocket.OPEN && pendingReloadRecovery && !reloadRecoveryAttempted) {
+      void recoverAfterReload(socket);
+    }
     renderOverlay();
     return socket;
   }
@@ -250,6 +268,39 @@
     } catch (error) {
       log(`Falha ao enviar ${message.type}: ${error}`, 'warn');
       return false;
+    }
+  }
+
+  async function recoverAfterReload(socket) {
+    if (!enabled || reloadRecoveryAttempted || !pendingReloadRecovery) return false;
+    if (!currentHuntSlug || !likelyInHunt) return false;
+    if (socket.readyState !== NativeWebSocket.OPEN) return false;
+
+    reloadRecoveryAttempted = true;
+    reconnectInProgress = true;
+    try {
+      await new Promise(resolve => setTimeout(resolve, CONFIG.reloadRecoveryDelayMs));
+      if (!enabled || socket.readyState !== NativeWebSocket.OPEN) {
+        lastFailedRejoinAt = now();
+        return false;
+      }
+      const entered = sendGameMessage({ type: 'enter-hunt', slug: currentHuntSlug });
+      if (!entered) {
+        lastFailedRejoinAt = now();
+        return false;
+      }
+      awaitingRejoinConfirmation = true;
+      rejoinConfirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
+      lastHuntActivityAt = now();
+      log(`Recuperação pós-reload iniciada em ${currentHuntSlug}; aguardando confirmação.`);
+      return true;
+    } catch (error) {
+      lastFailedRejoinAt = now();
+      log(`Falha na recuperação pós-reload: ${error}`, 'warn');
+      return false;
+    } finally {
+      reconnectInProgress = false;
+      renderOverlay();
     }
   }
 
@@ -314,8 +365,12 @@
       if (!socketDownSince) socketDownSince = t;
       if (likelyInHunt && currentHuntSlug && !reloadScheduled && t - socketDownSince >= CONFIG.socketReloadDelayMs) {
         reloadScheduled = true;
-        log('WebSocket continua fechado; recarregando a página.', 'warn');
-        setTimeout(() => { if (enabled) location.reload(); }, 1_000);
+        pendingReloadRecovery = true;
+        saveState({ reconnectPending: true });
+        log('WebSocket continua fechado; recarregando a página para tentar restaurar a Hunt.', 'warn');
+        setTimeout(() => {
+          if (enabled && pendingReloadRecovery) location.reload();
+        }, 1_000);
       }
       renderOverlay();
       return;
@@ -444,7 +499,15 @@
     enabled = readEnabled();
     lastCaptureBarSignature = getCaptureBarSignature();
     renderOverlay();
-    window.addEventListener('beforeunload', () => saveState());
+
+    window.addEventListener('beforeunload', () => {
+      if (enabled && likelyInHunt && currentHuntSlug && (reloadScheduled || socketDownSince > 0 || pendingReloadRecovery)) {
+        saveState({ reconnectPending: true });
+      } else {
+        saveState();
+      }
+    });
+
     window.addEventListener('resize', () => {
       if (!overlay) return;
       const rect = overlay.getBoundingClientRect();
@@ -455,6 +518,7 @@
       overlay.style.bottom = 'auto';
       savePosition(position.left, position.top);
     });
+
     setInterval(monitor, CONFIG.checkIntervalMs);
   }
 
