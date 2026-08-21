@@ -4,7 +4,7 @@ Extensão do Google Chrome para o Poke Idle World focada exclusivamente em Auto 
 
 ## Status
 
-Versão atual: `0.8.1`
+Versão atual: `0.8.2`
 
 Projeto independente e ainda em testes.
 
@@ -53,7 +53,6 @@ Ele pode ser arrastado e sua posição é salva localmente.
 PIW-Auto-Reconnect/
 ├── manifest.json
 ├── auto-reconnect.js
-├── panel-fix.js
 ├── README.md
 └── .gitignore
 ```
