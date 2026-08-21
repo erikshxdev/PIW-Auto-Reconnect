@@ -11,7 +11,7 @@
     reloadRecoveryDelayMs: 1_500,
     confirmationTimeoutMs: 15_000,
     checkIntervalMs: 1_000,
-    stateKey: 'piw_auto_reconnect_state_v13',
+    stateKey: 'piw_auto_reconnect_state_v14',
     positionKey: 'piw_auto_reconnect_position_v1',
     overlayId: 'piw-auto-reconnect-overlay'
   });
@@ -42,11 +42,8 @@
   }
 
   function loadState() {
-    try {
-      return JSON.parse(sessionStorage.getItem(CONFIG.stateKey) || '{}');
-    } catch {
-      return {};
-    }
+    try { return JSON.parse(sessionStorage.getItem(CONFIG.stateKey) || '{}'); }
+    catch { return {}; }
   }
 
   function saveState(extra = {}) {
@@ -62,12 +59,20 @@
     }
   }
 
+  function clearRecoveryState() {
+    recoveryPending = false;
+    recoveryAttempted = false;
+    awaitingConfirmation = false;
+    confirmationDeadline = 0;
+    saveState({ reconnectPending: false });
+  }
+
   function restoreState() {
     const state = loadState();
     if (typeof state.slug === 'string' && state.slug.trim()) currentHuntSlug = state.slug.trim();
     if (Number.isFinite(state.reconnectCount)) reconnectCount = Math.max(0, state.reconnectCount);
     recoveryPending = state.reconnectPending === true;
-    wasInHunt = recoveryPending && Boolean(currentHuntSlug);
+    wasInHunt = Boolean(currentHuntSlug && recoveryPending);
   }
 
   function getPosition() {
@@ -88,15 +93,25 @@
     return Boolean(gameSocket && gameSocket.readyState === NativeWebSocket.OPEN);
   }
 
+  function hasVisibleHuntUi() {
+    return Boolean(document.querySelector(
+      '[data-guide="capture-bar"], .hunt-ui, .battle-window, .wild-pokemon'
+    ));
+  }
+
   function inHuntContext() {
-    if (document.querySelector('[data-guide="capture-bar"], .hunt-ui, .battle-window, .wild-pokemon')) return true;
+    if (hasVisibleHuntUi()) return true;
     if (currentHuntSlug && wasInHunt && recoveryPending) return true;
+
     const analyzer = document.querySelector('.ha-window:not(.ha-compare-modal)');
-    return Boolean(currentHuntSlug && wasInHunt && analyzer);
+    if (currentHuntSlug && wasInHunt && analyzer) return true;
+
+    return Boolean(currentHuntSlug && wasInHunt && now() - lastHuntActivityAt < CONFIG.huntSilenceMs);
   }
 
   function captureBarSignature() {
-    return document.querySelector('[data-guide="capture-bar"]')?.innerHTML || '';
+    const node = document.querySelector('[data-guide="capture-bar"]');
+    return node ? node.innerHTML : '';
   }
 
   function isHuntActivity(message) {
@@ -121,11 +136,7 @@
 
     if (isHuntActivity(message)) lastHuntActivityAt = now();
 
-    if (
-      awaitingConfirmation &&
-      now() <= confirmationDeadline &&
-      CONFIRM_TYPES.has(String(message?.type || '').toLowerCase())
-    ) {
+    if (awaitingConfirmation && now() <= confirmationDeadline && CONFIRM_TYPES.has(String(message?.type || '').toLowerCase())) {
       confirmRecovery();
     }
   }
@@ -144,18 +155,18 @@
       wasInHunt = true;
       lastHuntActivityAt = now();
       socketDownSince = 0;
-      if (!awaitingConfirmation) {
-        recoveryPending = false;
-        recoveryAttempted = false;
-        saveState({ reconnectPending: false });
+
+      if (recoveryInProgress || awaitingConfirmation) {
+        saveState({ reconnectPending: true });
+      } else {
+        clearRecoveryState();
       }
       return;
     }
 
     if (type === 'leave-hunt' && !recoveryInProgress) {
       wasInHunt = false;
-      recoveryPending = false;
-      saveState({ reconnectPending: false });
+      clearRecoveryState();
     }
   }
 
@@ -199,9 +210,7 @@
   }
 
   function TrackedWebSocket(url, protocols) {
-    const socket = protocols === undefined
-      ? new NativeWebSocket(url)
-      : new NativeWebSocket(url, protocols);
+    const socket = protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
     return trackSocket(socket);
   }
 
@@ -225,37 +234,52 @@
   }
 
   function scheduleReload(reason) {
-    if (reloadScheduled || !currentHuntSlug || !wasInHunt) return;
+    if (reloadScheduled || !currentHuntSlug || !wasInHunt || recoveryInProgress) return;
 
     reloadScheduled = true;
     recoveryPending = true;
+    recoveryAttempted = false;
     saveState({ reconnectPending: true });
     log(`${reason} F5 para restaurar a Hunt.`, true);
 
     setTimeout(() => {
       if (recoveryPending) location.reload();
+      else reloadScheduled = false;
     }, 250);
   }
 
   async function restoreHuntAfterReload() {
     if (recoveryAttempted || !recoveryPending || !currentHuntSlug || !wasInHunt) return false;
-    if (!await waitForSocket()) return false;
+    if (!await waitForSocket()) {
+      recoveryAttempted = true;
+      recoveryPending = false;
+      saveState({ reconnectPending: false });
+      log('Não foi possível obter um WebSocket após o reload.', true);
+      return false;
+    }
 
     recoveryAttempted = true;
     recoveryInProgress = true;
 
+    // Arm confirmation BEFORE sending enter-hunt so the send observer
+    // knows this is the extension's recovery command.
+    awaitingConfirmation = true;
+    confirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
+    lastHuntActivityAt = now();
+
     try {
       await new Promise(resolve => setTimeout(resolve, CONFIG.reloadRecoveryDelayMs));
-      if (!await waitForSocket()) return false;
+      if (!await waitForSocket()) {
+        failRecoveryConfirmation('WebSocket não ficou disponível durante a recuperação.');
+        return false;
+      }
 
       gameSocket.send(JSON.stringify({ type: 'enter-hunt', slug: currentHuntSlug }));
-      awaitingConfirmation = true;
-      confirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
-      lastHuntActivityAt = now();
+      saveState({ reconnectPending: true });
       log(`Tentando restaurar a Hunt: ${currentHuntSlug}.`);
       return true;
     } catch (error) {
-      log(`Falha ao restaurar a Hunt: ${error}`, true);
+      failRecoveryConfirmation(`Falha ao restaurar a Hunt: ${error}`);
       return false;
     } finally {
       recoveryInProgress = false;
@@ -274,14 +298,22 @@
     renderOverlay();
   }
 
+  function failRecoveryConfirmation(reason) {
+    awaitingConfirmation = false;
+    confirmationDeadline = 0;
+    recoveryPending = false;
+    recoveryAttempted = true;
+    saveState({ reconnectPending: false });
+    log(`${reason} Não será feito outro F5 automaticamente.`, true);
+    renderOverlay();
+  }
+
   function monitor() {
     const t = now();
 
     if (awaitingConfirmation) {
       if (t > confirmationDeadline) {
-        awaitingConfirmation = false;
-        confirmationDeadline = 0;
-        log('Reconexão pós-F5 não foi confirmada.', true);
+        failRecoveryConfirmation('Reconexão pós-F5 não foi confirmada.');
       }
       renderOverlay();
       return;
@@ -338,6 +370,9 @@
   }
 
   function makeOverlayDraggable(el) {
+    if (el.dataset.dragBound === 'true') return;
+    el.dataset.dragBound = 'true';
+
     el.addEventListener('pointerdown', event => {
       if (event.button !== 0) return;
       const rect = el.getBoundingClientRect();
@@ -394,21 +429,17 @@
         overlay.style.bottom = '12px';
       }
 
-      const mount = () => {
-        const host = document.documentElement || document.body;
-        if (!host) return false;
-        if (!overlay.isConnected) host.appendChild(overlay);
-        makeOverlayDraggable(overlay);
-        return true;
-      };
-
-      if (!mount()) document.addEventListener('DOMContentLoaded', mount, { once: true });
+      makeOverlayDraggable(overlay);
     }
 
-    if (!overlay.isConnected) {
+    const mount = () => {
       const host = document.documentElement || document.body;
-      if (host) host.appendChild(overlay);
-    }
+      if (!host) return false;
+      if (!overlay.isConnected) host.appendChild(overlay);
+      return true;
+    };
+
+    if (!mount()) document.addEventListener('DOMContentLoaded', mount, { once: true });
 
     overlay.textContent = '';
     const status = document.createElement('div');
