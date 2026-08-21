@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
   "name": "PIW Auto Reconnect",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Monitora a Hunt do Poke Idle World e recupera a Hunt com F5 após inatividade.",
   "content_scripts": [
     {
       "matches": ["https://poke.idleworld.online/play"],
-      "js": ["auto-reconnect.js", "panel-fix.js"],
+      "js": ["auto-reconnect.js"],
       "run_at": "document_start",
       "world": "MAIN"
     }
