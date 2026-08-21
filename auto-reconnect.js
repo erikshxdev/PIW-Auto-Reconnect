@@ -1,9 +1,6 @@
 (() => {
   'use strict';
 
-  // PIW Auto Reconnect — reconnect only.
-  // Hunt stuck -> save current hunt -> F5 -> restore hunt.
-
   const NativeWebSocket = window.WebSocket;
   const nativeSend = NativeWebSocket.prototype.send;
   const trackedSockets = new WeakSet();
@@ -14,7 +11,7 @@
     reloadRecoveryDelayMs: 1_500,
     confirmationTimeoutMs: 15_000,
     checkIntervalMs: 1_000,
-    stateKey: 'piw_auto_reconnect_state_v12',
+    stateKey: 'piw_auto_reconnect_state_v13',
     positionKey: 'piw_auto_reconnect_position_v1',
     overlayId: 'piw-auto-reconnect-overlay'
   });
@@ -45,8 +42,11 @@
   }
 
   function loadState() {
-    try { return JSON.parse(sessionStorage.getItem(CONFIG.stateKey) || '{}'); }
-    catch { return {}; }
+    try {
+      return JSON.parse(sessionStorage.getItem(CONFIG.stateKey) || '{}');
+    } catch {
+      return {};
+    }
   }
 
   function saveState(extra = {}) {
@@ -66,9 +66,22 @@
     const state = loadState();
     if (typeof state.slug === 'string' && state.slug.trim()) currentHuntSlug = state.slug.trim();
     if (Number.isFinite(state.reconnectCount)) reconnectCount = Math.max(0, state.reconnectCount);
-
     recoveryPending = state.reconnectPending === true;
     wasInHunt = recoveryPending && Boolean(currentHuntSlug);
+  }
+
+  function getPosition() {
+    try {
+      const value = JSON.parse(localStorage.getItem(CONFIG.positionKey) || '{}');
+      if (Number.isFinite(value.left) && Number.isFinite(value.top)) return value;
+    } catch {}
+    return null;
+  }
+
+  function savePosition(left, top) {
+    try {
+      localStorage.setItem(CONFIG.positionKey, JSON.stringify({ left, top }));
+    } catch {}
   }
 
   function isSocketOpen() {
@@ -108,7 +121,11 @@
 
     if (isHuntActivity(message)) lastHuntActivityAt = now();
 
-    if (awaitingConfirmation && now() <= confirmationDeadline && CONFIRM_TYPES.has(String(message?.type || '').toLowerCase())) {
+    if (
+      awaitingConfirmation &&
+      now() <= confirmationDeadline &&
+      CONFIRM_TYPES.has(String(message?.type || '').toLowerCase())
+    ) {
       confirmRecovery();
     }
   }
@@ -154,12 +171,13 @@
     trackedSockets.add(socket);
     socketDownSince = 0;
     reloadScheduled = false;
+
     socket.addEventListener('message', observeIncoming);
     socket.addEventListener('open', () => {
       if (gameSocket !== socket) return;
       socketDownSince = 0;
       renderOverlay();
-      if (recoveryPending && !recoveryAttempted) void restoreHuntAfterReload(socket);
+      if (recoveryPending && !recoveryAttempted) void restoreHuntAfterReload();
     });
     socket.addEventListener('close', () => {
       if (gameSocket !== socket) return;
@@ -173,7 +191,7 @@
     });
 
     if (socket.readyState === NativeWebSocket.OPEN && recoveryPending && !recoveryAttempted) {
-      void restoreHuntAfterReload(socket);
+      void restoreHuntAfterReload();
     }
 
     renderOverlay();
@@ -181,7 +199,9 @@
   }
 
   function TrackedWebSocket(url, protocols) {
-    const socket = protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+    const socket = protocols === undefined
+      ? new NativeWebSocket(url)
+      : new NativeWebSocket(url, protocols);
     return trackSocket(socket);
   }
 
@@ -217,9 +237,9 @@
     }, 250);
   }
 
-  async function restoreHuntAfterReload(socket) {
+  async function restoreHuntAfterReload() {
     if (recoveryAttempted || !recoveryPending || !currentHuntSlug || !wasInHunt) return false;
-    if (socket.readyState !== NativeWebSocket.OPEN) return false;
+    if (!await waitForSocket()) return false;
 
     recoveryAttempted = true;
     recoveryInProgress = true;
@@ -228,16 +248,12 @@
       await new Promise(resolve => setTimeout(resolve, CONFIG.reloadRecoveryDelayMs));
       if (!await waitForSocket()) return false;
 
-      const sent = gameSocket.send(JSON.stringify({ type: 'enter-hunt', slug: currentHuntSlug }));
-      if (sent === undefined) {
-        awaitingConfirmation = true;
-        confirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
-        lastHuntActivityAt = now();
-        log(`Tentando restaurar a Hunt: ${currentHuntSlug}.`);
-        return true;
-      }
-
-      return false;
+      gameSocket.send(JSON.stringify({ type: 'enter-hunt', slug: currentHuntSlug }));
+      awaitingConfirmation = true;
+      confirmationDeadline = now() + CONFIG.confirmationTimeoutMs;
+      lastHuntActivityAt = now();
+      log(`Tentando restaurar a Hunt: ${currentHuntSlug}.`);
+      return true;
     } catch (error) {
       log(`Falha ao restaurar a Hunt: ${error}`, true);
       return false;
@@ -302,13 +318,12 @@
       lastHuntActivityAt = t;
     }
 
-    const silence = t - lastHuntActivityAt;
-    if (silence < CONFIG.huntSilenceMs) {
+    if (t - lastHuntActivityAt < CONFIG.huntSilenceMs) {
       renderOverlay();
       return;
     }
 
-    scheduleReload(`Hunt sem progresso por ${Math.floor(silence / 1000)} segundos.`);
+    scheduleReload(`Hunt sem progresso por ${Math.floor((t - lastHuntActivityAt) / 1000)} segundos.`);
     renderOverlay();
   }
 
@@ -379,8 +394,20 @@
         overlay.style.bottom = '12px';
       }
 
-      (document.documentElement || document.body)?.appendChild(overlay);
-      makeOverlayDraggable(overlay);
+      const mount = () => {
+        const host = document.documentElement || document.body;
+        if (!host) return false;
+        if (!overlay.isConnected) host.appendChild(overlay);
+        makeOverlayDraggable(overlay);
+        return true;
+      };
+
+      if (!mount()) document.addEventListener('DOMContentLoaded', mount, { once: true });
+    }
+
+    if (!overlay.isConnected) {
+      const host = document.documentElement || document.body;
+      if (host) host.appendChild(overlay);
     }
 
     overlay.textContent = '';
